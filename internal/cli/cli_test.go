@@ -314,6 +314,40 @@ targets:
 	}
 }
 
+// --- Cwd is honored end-to-end ---
+
+func TestRun_CwdHonored(t *testing.T) {
+	dir := t.TempDir()
+	cwdDir := t.TempDir() // distinct from project root so $(pwd) is unambiguous
+	out := filepath.Join(dir, "where")
+	path := filepath.Join(dir, "build.yml")
+	content := `
+targets:
+  t:
+    cwd: "` + cwdDir + `"
+    run: |
+      pwd > ` + out + `
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := Root(BuildInfo{Version: "test", Commit: "test"})
+	r.SetArgs([]string{"run", "t", "--file", path})
+	if err := r.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.TrimSpace(string(data))
+	if !strings.HasSuffix(got, filepath.Base(cwdDir)) {
+		t.Errorf("target ran in %q, want dir ending in %q (full want=%q)", got, filepath.Base(cwdDir), cwdDir)
+	}
+}
+
 // --- Unknown target ---
 
 func TestRun_UnknownTarget(t *testing.T) {

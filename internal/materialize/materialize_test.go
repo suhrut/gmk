@@ -10,21 +10,33 @@ import (
 	"github.com/suhrut/gmk/internal/ir"
 )
 
+// newTestProject constructs a Stage 2 Project with a populated RootScope.
+// Stage 1's test helper built only Project.Vars; Stage 2 requires RootScope
+// because resolve walks the scope chain. The aliasing of Project.Vars to
+// RootScope.Vars preserves backwards compat for any reader still using
+// the Stage 1 fields.
 func newTestProject(t *testing.T, vars map[string]string, run string) (*ir.Project, *ir.Target) {
 	t.Helper()
 	root := t.TempDir()
 	source := filepath.Join(root, "build.yml")
 
+	rootScope := &ir.Scope{
+		Path:     "/",
+		Vars:     make(map[string]*ir.Var, len(vars)),
+		VarOrder: make([]string, 0, len(vars)),
+	}
+	for k, v := range vars {
+		rootScope.Vars[k] = &ir.Var{Name: k, Value: v}
+		rootScope.VarOrder = append(rootScope.VarOrder, k)
+	}
+
 	p := &ir.Project{
 		SourcePath: source,
 		Root:       root,
-		Vars:       make(map[string]*ir.Var, len(vars)),
-		VarOrder:   make([]string, 0, len(vars)),
+		RootScope:  rootScope,
+		Vars:       rootScope.Vars,     // S1 backwards-compat alias
+		VarOrder:   rootScope.VarOrder, // S1 backwards-compat alias
 		Targets:    make(map[string]*ir.Target),
-	}
-	for k, v := range vars {
-		p.Vars[k] = &ir.Var{Name: k, Value: v}
-		p.VarOrder = append(p.VarOrder, k)
 	}
 
 	tgt := &ir.Target{Name: "hello", Run: run, Lang: "bash", Source: ir.SourceLoc{File: source}}
@@ -43,7 +55,6 @@ func TestWriteScript_Basic(t *testing.T) {
 		t.Fatalf("WriteScript: %v", err)
 	}
 
-	// Path should live under .gmk-cache/code/local/build.yml/hello.sh
 	wantSuffix := filepath.Join(".gmk-cache", "code", "local", "build.yml", "hello.sh")
 	if !strings.HasSuffix(path, wantSuffix) {
 		t.Errorf("path %q should end with %q", path, wantSuffix)
@@ -55,7 +66,6 @@ func TestWriteScript_Basic(t *testing.T) {
 	}
 	content := string(data)
 
-	// Header expectations.
 	if !strings.HasPrefix(content, "#!/usr/bin/env bash\n") {
 		t.Errorf("script should start with bash shebang, got first line: %q", firstLine(content))
 	}
@@ -69,7 +79,6 @@ func TestWriteScript_Basic(t *testing.T) {
 		t.Error("script header should mention target name")
 	}
 
-	// Body expectations: var should be resolved.
 	if !strings.Contains(content, `echo "hello world"`) {
 		t.Errorf("script body should contain resolved echo, got:\n%s", content)
 	}
@@ -77,7 +86,6 @@ func TestWriteScript_Basic(t *testing.T) {
 		t.Errorf("script body should not contain unresolved ${name}, got:\n%s", content)
 	}
 
-	// File should be executable.
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
@@ -88,7 +96,7 @@ func TestWriteScript_Basic(t *testing.T) {
 }
 
 func TestWriteScript_NoTrailingNewline(t *testing.T) {
-	p, tgt := newTestProject(t, nil, "echo hi") // no trailing newline
+	p, tgt := newTestProject(t, nil, "echo hi")
 	path, err := WriteScript(tgt, p)
 	if err != nil {
 		t.Fatal(err)
@@ -119,7 +127,11 @@ func TestWriteScript_PreservesMultilineBody(t *testing.T) {
 }
 
 func TestWriteScript_NilTarget(t *testing.T) {
-	p := &ir.Project{Root: t.TempDir(), SourcePath: "/tmp/build.yml"}
+	p := &ir.Project{
+		Root:       t.TempDir(),
+		SourcePath: "/tmp/build.yml",
+		RootScope:  &ir.Scope{Path: "/", Vars: make(map[string]*ir.Var)},
+	}
 	_, err := WriteScript(nil, p)
 	if err == nil {
 		t.Fatal("expected error for nil target")
@@ -145,8 +157,9 @@ func TestWriteScript_OverwriteExisting(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Change the var and re-materialize.
-	p.Vars["v"].Value = "second"
+	// Change the var via the RootScope (Stage 2 ground truth) — the alias
+	// on Project.Vars points at the same map so both reads see the update.
+	p.RootScope.Vars["v"].Value = "second"
 	path2, err := WriteScript(tgt, p)
 	if err != nil {
 		t.Fatal(err)
@@ -180,7 +193,6 @@ func TestAtomicWrite_NoTempFileLeft(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Only the target file should remain — no leftover .tmp.* files.
 	if len(entries) != 1 {
 		names := []string{}
 		for _, e := range entries {

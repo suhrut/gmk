@@ -43,7 +43,7 @@ func (e *ExitError) Error() string {
 
 // Options controls how a script is executed.
 //
-// Stage 1 supports only Env. Future stages add Cwd, Verbosity, Timeout,
+// Stage 2 supports Env, Lang, Cwd. Future stages add Verbosity, Timeout,
 // Stdin, and capture controls. Defaulting unknown fields to their zero
 // values keeps Run callable with Options{} for the common case.
 type Options struct {
@@ -56,9 +56,13 @@ type Options struct {
 	// extension via cache.InterpreterForLang's default ("bash").
 	Lang string
 
+	// Cwd is the working directory in which to run the script. Empty
+	// means inherit from the parent process. Set via os/exec's cmd.Dir,
+	// which is thread-safe (unlike a global os.Chdir).
+	Cwd string
+
 	// Reserved for later stages:
-	//   Cwd       string         // S2: working directory
-	//   Verbosity int            // S5: MYBUILD_V level to export
+	//   Verbosity int            // S5: GMK_V level to export
 	//   Timeout   time.Duration  // S5: kill timeout
 	//   Stdout    io.Writer      // S8: capture target
 	//   Stderr    io.Writer      // S8: capture target
@@ -86,6 +90,9 @@ func Run(scriptPath string, opts Options) error {
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
 	cmd.Env = composeEnv(opts.Env)
+	if opts.Cwd != "" {
+		cmd.Dir = opts.Cwd
+	}
 
 	if err := cmd.Run(); err != nil {
 		var exitErr *osexec.ExitError

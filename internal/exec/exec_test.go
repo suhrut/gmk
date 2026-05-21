@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -151,6 +152,52 @@ func TestComposeEnv_OverridesExisting(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("expected exactly 1 entry for overridden var, got %d", count)
+	}
+}
+
+func TestRun_CwdHonored(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash-dependent test")
+	}
+	scriptDir := t.TempDir()
+	cwdDir := t.TempDir() // distinct from scriptDir so $(pwd) != where the file lives
+	out := filepath.Join(scriptDir, "where")
+	path := writeScript(t, scriptDir, "pwd.sh", "pwd > "+out)
+
+	if err := Run(path, Options{Cwd: cwdDir}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.TrimSpace(string(data))
+	// macOS may resolve /tmp via /private/tmp; tolerate that by checking
+	// for the cwdDir basename suffix rather than exact string equality.
+	if !strings.HasSuffix(got, filepath.Base(cwdDir)) {
+		t.Errorf("script ran in %q, want a dir ending in %q", got, filepath.Base(cwdDir))
+	}
+}
+
+func TestRun_CwdEmpty_InheritsParent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash-dependent test")
+	}
+	dir := t.TempDir()
+	out := filepath.Join(dir, "where")
+	path := writeScript(t, dir, "pwd.sh", "pwd > "+out)
+
+	if err := Run(path, Options{}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	data, _ := os.ReadFile(out)
+	got := strings.TrimSpace(string(data))
+	if got == "" {
+		t.Errorf("script wrote empty pwd")
+	}
+	if !filepath.IsAbs(got) {
+		t.Errorf("pwd should be absolute, got %q", got)
 	}
 }
 

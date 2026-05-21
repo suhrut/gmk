@@ -93,17 +93,15 @@ func (s *ScriptRunner) Run(input map[string]any) (map[string]any, error) {
 		opts.Env = env
 	}
 
-	// "cwd" handling: Stage 2 leaves cwd unset (defaults to caller's
-	// current directory). exec.Options will gain a Cwd field in a future
-	// stage; we accept the input key now so callers can pass it without
-	// breakage, but warn via panic in tests if it's the wrong shape.
+	// "cwd" handling: the caller may pass a working directory for the
+	// script. We forward it via exec.Options.Cwd, which sets the child
+	// process's cmd.Dir (thread-safe; never touches the parent's pwd).
 	if cwdAny, ok := input["cwd"]; ok {
-		if _, ok := cwdAny.(string); !ok {
+		cwdStr, ok := cwdAny.(string)
+		if !ok {
 			return nil, fmt.Errorf("ScriptRunner.Run: input[\"cwd\"] must be string, got %T", cwdAny)
 		}
-		// Stage 2: stored but unused at exec layer. The CLI changes its
-		// own os.Chdir before invoking the runner; this satisfies the
-		// contract until exec.Options grows the field.
+		opts.Cwd = cwdStr
 	}
 
 	start := time.Now()

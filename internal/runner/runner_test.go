@@ -128,6 +128,33 @@ func TestScriptRunner_Run_BadCwdType(t *testing.T) {
 	}
 }
 
+// --- cwd input is honored ---
+
+func TestScriptRunner_Run_CwdHonored(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("bash-dependent test")
+	}
+	scriptDir := t.TempDir()
+	cwdDir := t.TempDir()
+	out := filepath.Join(scriptDir, "where")
+	path := writeScript(t, scriptDir, "pwd.sh", "pwd > "+out)
+
+	r := &ScriptRunner{ScriptPath: path, Lang: "bash"}
+	_, err := r.Run(map[string]any{"cwd": cwdDir})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.TrimSpace(string(data))
+	if !strings.HasSuffix(got, filepath.Base(cwdDir)) {
+		t.Errorf("ran in %q, want dir ending in %q", got, filepath.Base(cwdDir))
+	}
+}
+
 // --- Receiver guards ---
 
 func TestScriptRunner_Run_NilReceiver(t *testing.T) {
