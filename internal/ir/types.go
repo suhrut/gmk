@@ -4,7 +4,13 @@
 // Design discipline: fields are added across stages but never renamed.
 // Reserved-for-future-stage fields are documented in comments rather than
 // stubbed out, so the growth path is visible to anyone reading this file.
+//
+// Dependencies: ir imports expr (Stage 3a) for the Var.Expr field. The expr
+// package itself has no dependency on ir — it operates over interfaces, so
+// the dependency direction stays unidirectional.
 package ir
+
+import "github.com/suhrut/gmk/internal/expr"
 
 // Project is the root of a parsed gmk file. It contains all vars, targets,
 // and includes visible at the top level of the source YAML, plus a
@@ -144,32 +150,83 @@ type Include struct {
 	//   When *Expr  // S4: skip this include if condition is false
 }
 
+// VarKind classifies how a Var's value is produced. Stage 3a uses Literal
+// and Expression. Stage 3b adds Tagged (for !sh, !env, !files, !join).
+// Stage 5 may add Lazy (deferred evaluation marker).
+type VarKind int
+
+const (
+	// VarLiteral indicates a plain string value with no substitutions or
+	// expression syntax. The Value field holds the entire result; Expr is nil.
+	// resolve.Resolve treats these as a zero-evaluation fast path.
+	VarLiteral VarKind = iota
+
+	// VarExpression indicates a value that contains ${...} substitutions or
+	// expression operators. Expr holds the parsed AST; Value retains the raw
+	// YAML text for diagnostic display.
+	VarExpression
+
+	// VarTagged indicates a value produced by a YAML tag (!sh, !env, etc.).
+	// Reserved for Stage 3b; Stage 3a never produces this kind.
+	VarTagged
+)
+
+// String returns the human-readable name of the kind, used in diagnostic
+// output and `gmk explain` (Stage 8).
+func (k VarKind) String() string {
+	switch k {
+	case VarLiteral:
+		return "literal"
+	case VarExpression:
+		return "expression"
+	case VarTagged:
+		return "tagged"
+	default:
+		return "unknown"
+	}
+}
+
 // Var is a named value resolved within a scope.
 //
 // Stage 1: Value is a literal string with optional ${NAME} substitutions.
 // Stage 2: same; the scope into which the var is declared determines
 // visibility. The Var type itself is unchanged from Stage 1.
-// Stage 3 adds Kind/Tag/Expr fields when the expression grammar lands.
+// Stage 3a adds Kind and Expr fields:
+//   - Kind classifies the value's production strategy (Literal vs Expression).
+//   - Expr is the parsed AST for VarExpression vars; nil for VarLiteral.
+//
+// The Value field is always populated (raw YAML text retained for
+// diagnostic display and Stage 6's IR cache key). For VarLiteral, Value is
+// also the resolved value; for VarExpression, resolve evaluates Expr and
+// the resulting string is independent of Value.
 type Var struct {
 	// Name is the var's identifier (e.g., "qgw_dir").
 	Name string
 
 	// Value is the literal string content from YAML, as-written, including
-	// any unresolved ${...} substitution markers. The resolve package is
-	// responsible for substitution; this field stores the raw template.
+	// any unresolved ${...} substitution markers. The resolve package
+	// produces the final value by evaluating Expr (if non-nil); for
+	// VarLiteral vars, Value is used directly.
 	Value string
 
 	// Source is the file:line:column of this var's declaration in the
 	// source YAML, used for diagnostic messages.
 	Source SourceLoc
 
+	// Kind classifies the var's production strategy. Stage 3a sets this at
+	// load time. Stage 3b extends with VarTagged.
+	Kind VarKind
+
+	// Expr is the parsed expression AST when Kind == VarExpression (or, in
+	// Stage 3b, when Kind == VarTagged and the tag produces an expression).
+	// Nil for VarLiteral.
+	Expr expr.Node
+
 	// Reserved for later stages:
 	//
-	//   Kind  VarKind   // S3: Literal | Env | Ctx | Lazy | Computed
-	//   Tag   string    // S3: which !tag produced this
+	//   Tag   string    // S3b: which !tag produced this (when Kind == VarTagged)
 	//   Cache CacheMode // S6: parse | configure | ttl:* | per_run | per_read
 	//   Class string    // S9: secret | pii | pci | phi
-	//   Expr  *Expr     // S3: parsed expression AST
 }
 
 // Target is a runnable unit declared in YAML.

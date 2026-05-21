@@ -1,31 +1,40 @@
 // Package resolve provides variable lookup and ${...} substitution for
 // gmk var references inside strings.
 //
-// Stage 2 extends Stage 1 with scope-aware variants:
+// Stage 3a rewrites the substitution engine: where Stage 2 walked the
+// string byte-by-byte and resolved bare ${NAME} refs, Stage 3a uses the
+// internal/expr package to parse and evaluate a full expression grammar
+// (typed refs, modifiers, pipelines, functions, comparisons). The exported
+// function signatures are unchanged — all Stage 1/Stage 2 callers continue
+// to work without modification.
 //
-//   - Resolve / ResolveString:               operate against a Project's
-//     root scope (unchanged Stage 1 signature; now delegates to scope walks)
-//   - ResolveInScope / ResolveStringInScope: operate against an arbitrary
-//     scope, enabling target-level env resolution and (in S4+) per-target
-//     scopes with overrides.
+// Public API:
 //
-// The exported API across both pairs stays stable across stages. Stage 3
-// will replace the substitution grammar with a full expression parser
-// supporting typed refs (${env:HOME}, ${ctx:JWT}) and modifiers, but the
-// function signatures here are the long-term contract.
+//   - Resolve(name, project)            : Stage 1 entry point
+//   - ResolveString(s, project)         : Stage 1 entry point
+//   - ResolveInScope(name, scope)       : Stage 2 scope-aware
+//   - ResolveStringInScope(s, scope)    : Stage 2 scope-aware
+//
+// Internally, all four converge on expr.Evaluator + a scopeVarResolver
+// adapter that bridges ir.Scope to expr.VarResolver. Cycle detection
+// lives in the adapter (using a visit stack) since cycles can span
+// nested var refs.
 package resolve
 
 import (
 	"errors"
 	"fmt"
-	"strings"
+	"os"
 
+	"github.com/suhrut/gmk/internal/expr"
 	"github.com/suhrut/gmk/internal/ir"
 	"github.com/suhrut/gmk/internal/scope"
 )
 
-// ErrUndefined indicates a referenced var was not found in scope.
-var ErrUndefined = errors.New("undefined var reference")
+// ErrUndefined indicates a referenced var was not found in scope. Wraps
+// expr.ErrUndefinedVar so both old (errors.Is(err, ErrUndefined)) and new
+// (errors.Is(err, expr.ErrUndefinedVar)) call sites continue to work.
+var ErrUndefined = expr.ErrUndefinedVar
 
 // Resolve returns the resolved string value of a named var in the project's
 // root scope. Stage 1 backwards-compat wrapper around ResolveInScope.
@@ -36,7 +45,7 @@ func Resolve(name string, p *ir.Project) (string, error) {
 	return ResolveInScope(name, p.RootScope)
 }
 
-// ResolveString substitutes all ${NAME} references in s against the project's
+// ResolveString substitutes all ${...} references in s against the project's
 // root scope. Stage 1 backwards-compat wrapper around ResolveStringInScope.
 func ResolveString(s string, p *ir.Project) (string, error) {
 	if p == nil || p.RootScope == nil {
@@ -54,104 +63,175 @@ func ResolveInScope(name string, sc *ir.Scope) (string, error) {
 	if sc == nil {
 		return "", fmt.Errorf("%w: %s (nil scope)", ErrUndefined, name)
 	}
-	v, _ := scope.Lookup(sc, name)
-	if v == nil {
-		return "", fmt.Errorf("%w: %s", ErrUndefined, name)
+	resolver := newScopeResolver(sc)
+	val, err := resolver.ResolveVar(name)
+	if err != nil {
+		return "", err
 	}
-	return ResolveStringInScope(v.Value, sc)
+	return val.AsString(), nil
 }
 
-// ResolveStringInScope substitutes all ${NAME} references in s with their
+// ResolveStringInScope substitutes all ${...} references in s with their
 // resolved values from the given scope.
 //
-// Stage 2 grammar (unchanged from Stage 1, just now walks scopes):
+// Stage 3a grammar (full expression language) — see internal/expr for
+// details. Notable forms:
 //
-//	${NAME}       - bare reference to a var named NAME
-//	$$            - literal dollar sign (escape)
+//	${NAME}                 bare var reference
+//	${env:NAME}             OS environment lookup
+//	${ctx:NAME}             --ctx flag lookup (S4)
+//	${var:NAME}             explicit form of ${NAME}
+//	${NAME:-default}        bash-style default
+//	${NAME:?required-msg}   bash-style required; errors if unset/empty
+//	${NAME:+alternate}      bash-style alternate
+//	${X == Y}               equality test
+//	${upper(X)}             function call
+//	${X | upper | trim}     pipeline
+//	$$                      literal dollar sign
 //
-// Stage 3 will dramatically extend the grammar. The function signature
-// stays the same across stages.
-//
-// Resolution recurses: if a var's value contains ${other}, that ref is
-// resolved too. Cycle detection guards against infinite loops.
+// Resolution recurses through scope.Lookup: if a var's value contains a
+// ${other} ref, that ref is resolved against the same scope, with cycle
+// detection.
 func ResolveStringInScope(s string, sc *ir.Scope) (string, error) {
-	return resolveStringWithStack(s, sc, nil)
+	if sc == nil {
+		return "", fmt.Errorf("ResolveStringInScope: nil scope")
+	}
+	node, err := expr.ParseTemplate(s, expr.Position{})
+	if err != nil {
+		return "", err
+	}
+	resolver := newScopeResolver(sc)
+	e := newEvaluator(resolver)
+	return e.EvalToString(node)
 }
 
-func resolveStringWithStack(s string, sc *ir.Scope, stack []string) (string, error) {
-	var b strings.Builder
-	b.Grow(len(s))
+// ---------------------------------------------------------------------------
+// Internal: scope <-> expr.VarResolver adapter with cycle detection.
+// ---------------------------------------------------------------------------
 
-	i := 0
-	for i < len(s) {
-		c := s[i]
-
-		if c == '$' && i+1 < len(s) && s[i+1] == '$' {
-			b.WriteByte('$')
-			i += 2
-			continue
-		}
-
-		if c == '$' && i+1 < len(s) && s[i+1] == '{' {
-			end := strings.IndexByte(s[i+2:], '}')
-			if end < 0 {
-				return "", fmt.Errorf("unterminated ${ at position %d in %q", i, s)
-			}
-			name := s[i+2 : i+2+end]
-			if name == "" {
-				return "", fmt.Errorf("empty ${} at position %d in %q", i, s)
-			}
-			if !validVarName(name) {
-				return "", fmt.Errorf("invalid var reference ${%s} at position %d (Stage 2 supports only bare ${NAME})", name, i)
-			}
-
-			for _, seen := range stack {
-				if seen == name {
-					return "", fmt.Errorf("cyclic var reference: %s -> %s", strings.Join(stack, " -> "), name)
-				}
-			}
-
-			v, _ := scope.Lookup(sc, name)
-			if v == nil {
-				return "", fmt.Errorf("%w: %s", ErrUndefined, name)
-			}
-
-			expanded, err := resolveStringWithStack(v.Value, sc, append(stack, name))
-			if err != nil {
-				return "", err
-			}
-			b.WriteString(expanded)
-
-			i += 2 + end + 1
-			continue
-		}
-
-		b.WriteByte(c)
-		i++
-	}
-
-	return b.String(), nil
+// scopeVarResolver bridges ir.Scope (the gmk lexical region) to
+// expr.VarResolver (what the expression evaluator needs).
+//
+// stack tracks the active resolution chain for cycle detection. The
+// resolver is single-use per top-level resolve call but is shared across
+// the recursive var refs that resolution triggers, so cycle state
+// propagates correctly.
+type scopeVarResolver struct {
+	scope *ir.Scope
+	stack []string
 }
 
-func validVarName(s string) bool {
-	if s == "" {
-		return false
-	}
-	if !isNameStart(s[0]) {
-		return false
-	}
-	for i := 1; i < len(s); i++ {
-		if !isNameCont(s[i]) {
-			return false
+// newScopeResolver constructs a fresh resolver for one top-level resolve.
+func newScopeResolver(sc *ir.Scope) *scopeVarResolver {
+	return &scopeVarResolver{scope: sc}
+}
+
+// ResolveVar implements expr.VarResolver. Looks up `name` in the resolver's
+// scope, evaluates its expression (if any) against the same scope, and
+// returns the resulting Value.
+//
+// Three production paths:
+//
+//  1. v.Expr != nil           — pre-parsed AST (the load.buildVar path).
+//     Most production calls land here.
+//  2. v.Expr == nil, no $     — pure literal. Return v.Value directly.
+//  3. v.Expr == nil, has $    — fallback: parse v.Value as a template
+//     on-the-fly. This supports Vars constructed programmatically
+//     (test helpers, future plugin API) without forcing every caller
+//     through load.buildVar.
+//
+// On cycle: returns an error wrapping expr.ErrCycle.
+// On miss: returns an error wrapping expr.ErrUndefinedVar (== ErrUndefined).
+func (r *scopeVarResolver) ResolveVar(name string) (expr.Value, error) {
+	for _, prior := range r.stack {
+		if prior == name {
+			chain := append([]string{}, r.stack...)
+			chain = append(chain, name)
+			return expr.NewNone(), fmt.Errorf("%w: %s",
+				expr.ErrCycle, joinChain(chain))
 		}
 	}
-	return true
+
+	v, _ := scope.Lookup(r.scope, name)
+	if v == nil {
+		return expr.NewNone(), fmt.Errorf("%w: %s", ErrUndefined, name)
+	}
+
+	// Path 1: pre-parsed AST.
+	if v.Expr != nil {
+		r.stack = append(r.stack, name)
+		defer func() { r.stack = r.stack[:len(r.stack)-1] }()
+		e := newEvaluator(r)
+		return e.Eval(v.Expr)
+	}
+
+	// Path 2: pure literal (no template markers). Fast path; the common
+	// case for both VarLiteral-tagged production vars and test-helper Vars
+	// holding plain strings.
+	if !containsTemplateMarker(v.Value) {
+		return expr.NewString(v.Value), nil
+	}
+
+	// Path 3: Value contains ${...} but wasn't pre-parsed. Parse on the fly.
+	// Slower than path 1 but happens once per name per top-level resolve,
+	// not in any tight inner loop.
+	pos := expr.Position{File: v.Source.File, Line: v.Source.Line, Col: v.Source.Column}
+	node, perr := expr.ParseTemplate(v.Value, pos)
+	if perr != nil {
+		return expr.NewNone(), perr
+	}
+	r.stack = append(r.stack, name)
+	defer func() { r.stack = r.stack[:len(r.stack)-1] }()
+	e := newEvaluator(r)
+	return e.Eval(node)
 }
 
-func isNameStart(c byte) bool {
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+// containsTemplateMarker is a quick check for "this value might contain
+// a substitution". It's intentionally a byte scan rather than a full parse —
+// if there's no '$' anywhere, the Value is definitely a pure literal.
+func containsTemplateMarker(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '$' {
+			return true
+		}
+	}
+	return false
 }
 
-func isNameCont(c byte) bool {
-	return isNameStart(c) || (c >= '0' && c <= '9')
+// newEvaluator constructs an expr.Evaluator wired up with the standard
+// gmk providers (OS env, no-op ctx for Stage 3a) and the default function
+// registry.
+//
+// Stage 4 will swap CtxProvider with a real --ctx flag lookup.
+// Stage 7 will add a ProbeProvider.
+// Stage 12 will allow plugins to register additional Funcs.
+func newEvaluator(vars expr.VarResolver) *expr.Evaluator {
+	return &expr.Evaluator{
+		Vars:        vars,
+		EnvProvider: os.LookupEnv,
+		CtxProvider: stubCtxProvider, // S3a: never set; modifiers detect via IsEmpty
+		Funcs:       expr.DefaultFuncs(),
+	}
 }
+
+// stubCtxProvider returns (_, false) for everything. The --ctx flag isn't
+// wired up until Stage 4; for now, ${ctx:NAME} resolves to None and
+// modifiers can supply defaults or required-errors.
+func stubCtxProvider(name string) (string, bool) { return "", false }
+
+// joinChain renders a stack of var names with " -> " separators.
+func joinChain(chain []string) string {
+	if len(chain) == 0 {
+		return ""
+	}
+	out := chain[0]
+	for _, c := range chain[1:] {
+		out += " -> " + c
+	}
+	return out
+}
+
+// Compile-time check: the package's ErrUndefined wraps expr.ErrUndefinedVar.
+// Callers using errors.Is(err, resolve.ErrUndefined) continue to match
+// expression-layer undefined-var errors transparently.
+var _ = errors.Is

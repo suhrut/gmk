@@ -2,6 +2,7 @@ package resolve
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -212,19 +213,172 @@ func TestResolveInScope_Undefined(t *testing.T) {
 	}
 }
 
-func TestValidVarName(t *testing.T) {
-	cases := []struct {
-		s    string
-		want bool
-	}{
-		{"x", true}, {"_", true}, {"foo", true}, {"_foo", true},
-		{"foo_bar", true}, {"FOO_BAR_123", true},
-		{"", false}, {"1foo", false}, {"foo-bar", false},
-		{"foo.bar", false}, {"foo bar", false},
+// Note: Stage 2's TestValidVarName test was removed when the expression
+// engine took over var-name validation. Identifier rules now live in
+// internal/expr/lexer.go (isIdentStart, isIdentCont) and are exercised
+// indirectly by every ${name} parse test in expr/parser_test.go.
+
+// ============================================================================
+// Stage 3a additions: expression language reachable through ResolveString.
+// ============================================================================
+//
+// These tests exercise the new grammar paths end-to-end via the public
+// resolve API. The expr package has its own focused tests for AST building
+// and evaluation; here we verify the resolve <-> expr bridge works:
+// scope-based var resolution, env/ctx providers, function dispatch, and
+// error wrapping (ErrUndefined / ErrCycle / expr.ErrRequired).
+
+func TestResolveString_TypedRef_EnvSet(t *testing.T) {
+	t.Setenv("GMK_TEST_VAR", "from_env")
+	p := newProjectWithVars(nil)
+	got, err := ResolveString("env_value=${env:GMK_TEST_VAR}", p)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range cases {
-		if got := validVarName(tc.s); got != tc.want {
-			t.Errorf("validVarName(%q) = %v, want %v", tc.s, got, tc.want)
-		}
+	if got != "env_value=from_env" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestResolveString_TypedRef_EnvUnsetIsEmpty(t *testing.T) {
+	os.Unsetenv("GMK_UNSET_VAR_NEVER_EXISTS_999")
+	p := newProjectWithVars(nil)
+	got, err := ResolveString("[${env:GMK_UNSET_VAR_NEVER_EXISTS_999}]", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "[]" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestResolveString_Modifier_Default(t *testing.T) {
+	os.Unsetenv("GMK_DEFAULT_TEST_999")
+	p := newProjectWithVars(nil)
+	got, err := ResolveString("${env:GMK_DEFAULT_TEST_999:-fallback}", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "fallback" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestResolveString_Modifier_Required_FiresOnUndefined(t *testing.T) {
+	p := newProjectWithVars(nil)
+	_, err := ResolveString("${missing:?must be set}", p)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	// Error message should carry the user's "must be set" message.
+	if !strings.Contains(err.Error(), "must be set") {
+		t.Errorf("err should include user msg, got %v", err)
+	}
+}
+
+func TestResolveString_Modifier_Required_PassesOnSet(t *testing.T) {
+	p := newProjectWithVars(map[string]string{"x": "value"})
+	got, err := ResolveString("${x:?must be set}", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "value" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestResolveString_Pipeline_Upper(t *testing.T) {
+	p := newProjectWithVars(map[string]string{"name": "hello"})
+	got, err := ResolveString("${name | upper}", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "HELLO" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestResolveString_Pipeline_Chain(t *testing.T) {
+	p := newProjectWithVars(map[string]string{"name": "  hi  "})
+	got, err := ResolveString("${name | trim | upper}", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "HI" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestResolveString_FuncCall(t *testing.T) {
+	p := newProjectWithVars(map[string]string{"a": "hello world"})
+	got, err := ResolveString(`${starts_with(a, "hello")}`, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "true" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestResolveString_Comparison(t *testing.T) {
+	p := newProjectWithVars(map[string]string{"env": "prod"})
+	got, err := ResolveString(`${env == "prod"}`, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "true" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestResolveString_MixedTextAndExpression(t *testing.T) {
+	p := newProjectWithVars(map[string]string{"user": "gss"})
+	got, err := ResolveString("hello, ${user | upper}! welcome.", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "hello, GSS! welcome." {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestResolveString_VarTypedRef(t *testing.T) {
+	// ${var:name} is explicit form of ${name}; both should resolve identically.
+	p := newProjectWithVars(map[string]string{"x": "explicit"})
+	got, err := ResolveString("${var:x}", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "explicit" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestResolveString_DeepNestedVars(t *testing.T) {
+	p := newProjectWithVars(map[string]string{
+		"a": "${b}",
+		"b": "${c}",
+		"c": "${d}",
+		"d": "leaf",
+	})
+	got, err := ResolveString("${a}", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "leaf" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestResolveString_ErrorIncludesPositionContext(t *testing.T) {
+	// When a missing var is encountered, the error should mention the
+	// var name in a useful form.
+	p := newProjectWithVars(nil)
+	_, err := ResolveString("${missing_xyz}", p)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "missing_xyz") {
+		t.Errorf("err should include var name, got %v", err)
 	}
 }

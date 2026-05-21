@@ -358,53 +358,261 @@ targets:
 
 // --- Helpers ---
 
-func TestVarsBlockSuffix(t *testing.T) {
+// Stage 3a renamed `varsBlockSuffix` (returning suffix int) to
+// `isVarsBlockKey` (returning bool) because declaration order is now read
+// from the YAML AST — there's no longer a numeric suffix to sort by.
+// Block order in the file == iteration order.
+func TestIsVarsBlockKey(t *testing.T) {
 	cases := []struct {
-		key    string
-		wantN  int
-		wantOK bool
+		key  string
+		want bool
 	}{
-		{"vars", 0, true},
-		{"vars_1", 1, true},
-		{"vars_99", 99, true},
-		{"vars_", 0, false},
-		{"vars.1", 0, false},
-		{"vars_foo", 0, false},
-		{"vars_-1", 0, false},
-		{"varsx", 0, false},
-		{"", 0, false},
+		{"vars_1", true},
+		{"vars_99", true},
+		{"vars", false},   // handled separately as the bare "vars" key
+		{"vars_", false},  // empty suffix
+		{"vars.1", false}, // wrong separator
+		{"vars_foo", false},
+		{"vars_-1", false},
+		{"varsx", false},
+		{"", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.key, func(t *testing.T) {
-			n, ok := varsBlockSuffix(tc.key)
-			if n != tc.wantN || ok != tc.wantOK {
-				t.Errorf("varsBlockSuffix(%q) = (%d, %v), want (%d, %v)",
-					tc.key, n, ok, tc.wantN, tc.wantOK)
+			if got := isVarsBlockKey(tc.key); got != tc.want {
+				t.Errorf("isVarsBlockKey(%q) = %v, want %v", tc.key, got, tc.want)
 			}
 		})
 	}
 }
 
-func TestCoerceToString(t *testing.T) {
-	cases := []struct {
-		in   any
-		want string
-	}{
-		{"plain", "plain"},
-		{int(42), "42"},
-		{int64(123), "123"},
-		{float64(3.14), "3.14"},
-		{true, "true"},
-		{false, "false"},
-		{nil, ""},
+// ============================================================================
+// Stage 3a additions: declaration order, VarKind classification, tag rejection
+// ============================================================================
+
+func TestLoad_S3a_VarsDeclarationOrderPreserved(t *testing.T) {
+	// In Stage 2, vars order was alphabetical. In Stage 3a it must reflect
+	// the YAML source order. We use names that don't sort alphabetically
+	// in the order we declare them, to make the difference observable.
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "build.yml")
+	content := `
+vars:
+  zeta: "1"
+  alpha: "2"
+  middle: "3"
+  beta: "4"
+
+targets:
+  noop:
+    run: "true"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range cases {
-		got, err := coerceToString(tc.in)
-		if err != nil {
-			t.Errorf("coerceToString(%v): unexpected error %v", tc.in, err)
-		}
-		if got != tc.want {
-			t.Errorf("coerceToString(%v) = %q, want %q", tc.in, got, tc.want)
+	p, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"zeta", "alpha", "middle", "beta"}
+	if !equalStrings(p.RootScope.VarOrder, want) {
+		t.Errorf("VarOrder = %v, want %v", p.RootScope.VarOrder, want)
+	}
+}
+
+func TestLoad_S3a_MultipleVarsBlocksOrderByDeclaration(t *testing.T) {
+	// Test that with vars + vars_1 + vars_2, names appear in the order they
+	// were declared across blocks (not sorted alphabetically within a block).
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "build.yml")
+	content := `
+vars:
+  z: "first"
+  a: "second"
+
+vars_1:
+  m: "third"
+
+vars_2:
+  b: "fourth"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"z", "a", "m", "b"}
+	if !equalStrings(p.RootScope.VarOrder, want) {
+		t.Errorf("VarOrder = %v, want %v", p.RootScope.VarOrder, want)
+	}
+}
+
+func TestLoad_S3a_VarKindClassification(t *testing.T) {
+	// Pure literal vars get VarLiteral + nil Expr (the fast path).
+	// Vars with ${} get VarExpression + non-nil Expr.
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "build.yml")
+	content := `
+vars:
+  plain: "just a string"
+  with_ref: "hello ${plain}"
+  with_modifier: "${env:HOME:-/tmp}"
+  with_pipeline: "${plain | upper}"
+
+targets:
+  noop:
+    run: "true"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	plain := p.RootScope.Vars["plain"]
+	if plain == nil {
+		t.Fatal("var 'plain' missing")
+	}
+	// We import ir to use ir.VarLiteral; resolve that via package's ir.
+	if plain.Expr != nil {
+		t.Errorf("'plain' should have nil Expr (literal), got %T", plain.Expr)
+	}
+
+	withRef := p.RootScope.Vars["with_ref"]
+	if withRef == nil {
+		t.Fatal("var 'with_ref' missing")
+	}
+	if withRef.Expr == nil {
+		t.Errorf("'with_ref' should have non-nil Expr (expression)")
+	}
+
+	withMod := p.RootScope.Vars["with_modifier"]
+	if withMod == nil || withMod.Expr == nil {
+		t.Errorf("'with_modifier' should have non-nil Expr")
+	}
+
+	withPipe := p.RootScope.Vars["with_pipeline"]
+	if withPipe == nil || withPipe.Expr == nil {
+		t.Errorf("'with_pipeline' should have non-nil Expr")
+	}
+}
+
+func TestLoad_S3a_VarSourcePositionsRecorded(t *testing.T) {
+	// AST mode gives us source positions on every value. Verify Var.Source
+	// has line numbers (not just file).
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "build.yml")
+	content := `vars:
+  first: "v1"
+  second: "v2"
+targets:
+  t:
+    run: "true"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first := p.RootScope.Vars["first"]; first.Source.Line == 0 {
+		t.Errorf("expected non-zero source line for 'first', got %+v", first.Source)
+	}
+	if second := p.RootScope.Vars["second"]; second.Source.Line == 0 {
+		t.Errorf("expected non-zero source line for 'second', got %+v", second.Source)
+	}
+	first := p.RootScope.Vars["first"]
+	second := p.RootScope.Vars["second"]
+	if first.Source.Line >= second.Source.Line {
+		t.Errorf("expected first.Line < second.Line, got %d vs %d", first.Source.Line, second.Source.Line)
+	}
+}
+
+func TestLoad_S3a_TaggedValueRejected(t *testing.T) {
+	// Stage 3b will accept !sh, !env, etc. For Stage 3a we reject with
+	// a clear error so users don't get confusing silent behaviour.
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "build.yml")
+	content := `
+vars:
+  sh_var: !sh "echo hi"
+
+targets:
+  noop:
+    run: "true"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for tagged value")
+	}
+	if !errors.Is(err, ErrTaggedValue) {
+		t.Errorf("err = %v, want wrapping ErrTaggedValue", err)
+	}
+}
+
+func TestLoad_S3a_BadExpressionRejectedAtLoad(t *testing.T) {
+	// Syntax errors in expressions should surface at Load(), not at
+	// Resolve(). This matches the Stage 1 promise: parse errors fail fast.
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "build.yml")
+	content := `
+vars:
+  broken: "${unterminated"
+
+targets:
+  noop:
+    run: "true"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected parse error for unterminated ${")
+	}
+}
+
+func TestLoad_S3a_DuplicateTopLevelKeyRejected(t *testing.T) {
+	// Duplicate keys at top level should be a hard error (Stage 2 silently
+	// took the last). YAML libraries may or may not surface this; our
+	// validate pass catches it explicitly.
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "build.yml")
+	content := `
+vars:
+  a: "1"
+vars:
+  b: "2"
+targets:
+  t:
+    run: "true"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for duplicate top-level key")
+	}
+}
+
+// equalStrings compares two string slices for equality.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
 		}
 	}
+	return true
 }
