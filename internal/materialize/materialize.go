@@ -70,7 +70,7 @@ func WriteScript(t *ir.Target, p *ir.Project) (string, error) {
 
 	content := renderBash(t, p, body)
 
-	if err := atomicWrite(path, content, 0o755); err != nil {
+	if err := atomicWrite(path, []byte(content), 0o755); err != nil {
 		return "", fmt.Errorf("materialize %s: write %s: %w", t.Name, path, err)
 	}
 
