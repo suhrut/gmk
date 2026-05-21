@@ -1,0 +1,27 @@
+# examples/hello/build.yml
+#
+# Minimal gmk example. After building gmk:
+#
+#   ./gmk run hello --file examples/hello/build.yml
+#
+# Should print:
+#
+#   hello from gmk, world!
+#
+# The materialized script will be written to:
+#
+#   examples/hello/.gmk-cache/code/local/examples/hello/build.yml/hello.sh
+#
+# You can inspect or re-run it standalone:
+#
+#   cat   examples/hello/.gmk-cache/code/local/examples/hello/build.yml/hello.sh
+#   bash  examples/hello/.gmk-cache/code/local/examples/hello/build.yml/hello.sh
+
+vars:
+  greeting: "hello"
+  target:   "world"
+
+targets:
+  hello:
+    run: |
+      echo "${greeting} from gmk, ${target}!"
