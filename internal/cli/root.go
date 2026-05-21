@@ -8,7 +8,6 @@ package cli
 
 import (
 	"github.com/spf13/cobra"
-
 )
 
 // BuildInfo carries version and commit metadata injected at build time
@@ -39,6 +38,7 @@ See https://github.com/suhrut/gmk for the spec and examples.`,
 
 	r.AddCommand(newVersionCmd(bi))
 	r.AddCommand(newRunCmd())
+	r.AddCommand(newDryRunCmd())
 
 	return r
 }

@@ -1,27 +1,53 @@
 # examples/hello/build.yml
 #
-# Minimal gmk example. After building gmk:
+# Stage 2 demonstration:
+#   - includes:    pull in vars/common.yml
+#   - vars + vars_1: multiple vars blocks merged in numeric order
+#   - deps:        target dependency chain
+#   - env:         per-target environment with var substitution
+#   - cwd:         per-target working directory
+#
+# Try it:
 #
 #   ./gmk run hello --file examples/hello/build.yml
+#   ./gmk dryrun hello --file examples/hello/build.yml
 #
-# Should print:
+# The materialized scripts land under:
 #
-#   hello from gmk, world!
+#   examples/hello/.gmk-cache/code/local/examples/hello/build.yml/*.sh
 #
-# The materialized script will be written to:
-#
-#   examples/hello/.gmk-cache/code/local/examples/hello/build.yml/hello.sh
-#
-# You can inspect or re-run it standalone:
-#
-#   cat   examples/hello/.gmk-cache/code/local/examples/hello/build.yml/hello.sh
-#   bash  examples/hello/.gmk-cache/code/local/examples/hello/build.yml/hello.sh
+# Each script is standalone — cat or bash them directly.
+
+includes:
+  - "./vars/common.yml"
 
 vars:
   greeting: "hello"
-  target:   "world"
+  target: "world"
+
+# Second vars block (suffix _1) overrides and extends.
+# Use vars_1, vars_2, ... — the dot suffix (vars.1) is reserved for
+# future folder-namespacing of vars.
+vars_1:
+  full_greeting: "${greeting} from gmk, ${target}!"
+  build_note: "running from ${project_name}"
 
 targets:
-  hello:
+  # A simple preparation step with no deps. Demonstrates phony semantics.
+  prep:
+    phony: true
     run: |
-      echo "${greeting} from gmk, ${target}!"
+      echo "[prep] starting build pipeline"
+
+  # The main target. Depends on prep, uses env + cwd.
+  hello:
+    deps: [prep]
+    env:
+      BUILD_NOTE: "${build_note}"
+      EXTRA: "stage 2 is running"
+    cwd: "/tmp"
+    run: |
+      echo "${full_greeting}"
+      echo "$BUILD_NOTE"
+      echo "$EXTRA"
+      echo "working dir: $(pwd)"

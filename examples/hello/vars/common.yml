@@ -1,0 +1,9 @@
+# examples/hello/vars/common.yml
+#
+# A small library of shared vars, included by ../build.yml.
+# Demonstrates that included files contribute vars to the including
+# scope via scope.Lookup walking.
+
+vars:
+  project_name: "gmk-hello-example"
+  default_target: "world"
