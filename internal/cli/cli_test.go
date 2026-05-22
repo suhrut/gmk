@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"os"
+	"io/fs"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -50,7 +51,20 @@ targets:
 		t.Fatalf("Execute: %v", err)
 	}
 
-	scriptPath := filepath.Join(dir, ".gmk-cache", "code", "local", "build.yml", "hello.sh")
+	// Stage 3b post-fix: scripts live at .gmk-cache/bodies/<sha256>/body.sh
+	// (content-addressed, project-wide). Find it by walking the bodies dir
+	// — there's exactly one body for this one-target build.
+	bodiesDir := filepath.Join(dir, ".gmk-cache", "bodies")
+	var scriptPath string
+	_ = filepath.WalkDir(bodiesDir, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.HasSuffix(p, "/body.sh") {
+			scriptPath = p
+		}
+		return nil
+	})
+	if scriptPath == "" {
+		t.Fatalf("no body.sh found under %s", bodiesDir)
+	}
 	data, err := os.ReadFile(scriptPath)
 	if err != nil {
 		t.Fatalf("script not materialized: %v", err)

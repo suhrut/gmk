@@ -1,35 +1,49 @@
 package cli
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"io"
+	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/suhrut/gmk/internal/dag"
-	gexec "github.com/suhrut/gmk/internal/exec"
 	"github.com/suhrut/gmk/internal/ir"
 	"github.com/suhrut/gmk/internal/load"
 	"github.com/suhrut/gmk/internal/materialize"
 	"github.com/suhrut/gmk/internal/resolve"
 	"github.com/suhrut/gmk/internal/runner"
+	"github.com/suhrut/gmk/internal/store"
 )
 
 // newRunCmd returns the `gmk run <target>` command.
 //
-// Stage 2 flow:
+// Stage 3b post-fix flow (was Stage 1 cache.WriteScript before):
+//
 //  1. Load project (with includes and scope tree)
 //  2. Build a dep graph over all targets reachable from <target>
-//  3. Topo-sort; execute each target in order via runner.ScriptRunner
-//  4. On failure: stop, propagate the error with the target name
+//  3. Topo-sort
+//  4. Open SQLite store at .gmk-cache/gmk.db (once for the whole run)
+//  5. For each target in order:
+//     - Allocate a (day, seq) via store
+//     - Materialize into runs/<day>/<seq>-<target>/
+//     - Record start in runs table
+//     - Run the body via runner.RunCallable
+//     - Update runs row with status, duration, exit code
+//  6. On failure: stop, propagate the error with the target name
 //
 // Stage 2 flags:
 //
 //	--file/-f    path to top-level YAML (default "build.yml")
 //	--dry-run    show what would run without executing (same as `gmk dryrun X`)
 //
-// Future stages add: -v / --verbose, --jobs N, --keep-going, etc.
+// Why migrate `run` to the same path as `call`: target invocations and
+// function invocations are both "execute a callable, record what
+// happened." Keeping two parallel paths means two places to fix bugs,
+// two layouts under .gmk-cache, two race profiles. One path keeps the
+// system consistent and gives users a single mental model.
 func newRunCmd() *cobra.Command {
 	var (
 		file   string
@@ -53,9 +67,6 @@ func newRunCmd() *cobra.Command {
 
 // executeRun is the shared core of `gmk run` and `gmk dryrun`. The dryRun
 // flag toggles between actual execution and printed-only mode.
-//
-// It's exported via lowercase-but-package-visible naming so dryrun.go can
-// call into it without duplicating the load+plan logic.
 func executeRun(out io.Writer, file, targetName string, dryRun bool) error {
 	project, err := load.Load(file)
 	if err != nil {
@@ -81,56 +92,122 @@ func executeRun(out io.Writer, file, targetName string, dryRun bool) error {
 		return printDryRunPlan(out, project, order)
 	}
 
+	// Open the store once per top-level `gmk run`. Every target in the
+	// dep chain gets its own (day, seq) from this same handle, and
+	// every runs-row update goes through it.
+	st, err := store.Open(project.Root)
+	if err != nil {
+		return fmt.Errorf("open store: %w", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	day := materialize.Today()
+
 	fmt.Fprintf(out, "gmk: running %s\n", formatList(order))
 
 	for _, name := range order {
-		if err := runOneTarget(out, project, project.Targets[name]); err != nil {
+		if err := runOneTarget(ctx, out, project, project.Targets[name], st, day); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// runOneTarget materializes and executes a single target. Errors are
-// wrapped with the target name for clean diagnostic surfaces.
-func runOneTarget(out io.Writer, project *ir.Project, t *ir.Target) error {
+// runOneTarget materializes and executes a single target through the
+// Stage 3b store-backed path. Errors wrap the target name for clean
+// diagnostic surfaces.
+func runOneTarget(ctx context.Context, out io.Writer, project *ir.Project, t *ir.Target, st *store.Store, day string) error {
 	fmt.Fprintf(out, "gmk: target %s\n", t.Name)
 
-	scriptPath, err := materialize.WriteScript(t, project)
-	if err != nil {
-		return err
-	}
-
-	// Resolve target's Env against the project's root scope (Stage 2;
-	// Stage 4 will use a per-target scope here).
+	// Resolve env and cwd against the project's root scope before
+	// materializing — Stage 1 did this in run.go, Stage 3b's
+	// MaterializeOpts takes the resolved values via c.Env / c.Cwd on
+	// the Callable struct.
 	resolvedEnv, err := resolveTargetEnv(project, t)
 	if err != nil {
 		return fmt.Errorf("target %q: env resolution: %w", t.Name, err)
 	}
-
-	r := &runner.ScriptRunner{ScriptPath: scriptPath, Lang: t.Lang}
-	input := map[string]any{}
-	if len(resolvedEnv) > 0 {
-		input["env"] = resolvedEnv
-	}
-	if t.Cwd != "" {
-		// Resolve ${...} in cwd against the project's root scope, matching
-		// how env values are handled above. Without this, a YAML cwd of
-		// "${work_dir}" would be passed literally to exec and fail ENOENT.
-		resolvedCwd, err := resolve.ResolveStringInScope(t.Cwd, project.RootScope)
+	resolvedCwd := t.Cwd
+	if resolvedCwd != "" {
+		resolvedCwd, err = resolve.ResolveStringInScope(t.Cwd, project.RootScope)
 		if err != nil {
 			return fmt.Errorf("target %q: cwd resolution: %w", t.Name, err)
 		}
-		input["cwd"] = resolvedCwd
 	}
 
-	_, err = r.Run(input)
+	// Resolve ${...} substitutions in the target body so Stage 1
+	// behavior is preserved — body text gets project vars expanded.
+	// This is the one place where target run differs from function
+	// call: targets historically had body interpolation, functions
+	// don't (they use $GMK_ARGS instead).
+	resolvedRun, err := resolve.ResolveStringInScope(t.Run, project.RootScope)
 	if err != nil {
-		var exitErr *gexec.ExitError
-		if errors.As(err, &exitErr) {
-			return fmt.Errorf("target %q failed (exit %d): %w", t.Name, exitErr.ExitCode, err)
-		}
-		return fmt.Errorf("target %q failed: %w", t.Name, err)
+		return fmt.Errorf("target %q: body resolution: %w", t.Name, err)
+	}
+
+	c := materialize.CallableFromTarget(t)
+	c.Run = resolvedRun
+	c.Env = resolvedEnv
+	c.Cwd = resolvedCwd
+
+	inv, err := materialize.MaterializeCallable(c, materialize.MaterializeOpts{
+		ProjectRoot: project.Root,
+		Store:       st,
+		Day:         day,
+		Languages:   project.Languages,
+		SourceFile:  t.Source.File,
+		// Args and PreludeValues empty: target invocation has no
+		// caller-supplied args, and prelude (if any) is evaluated
+		// when targets gain it in Stage 4. For now any Target.Prelude
+		// is honored by future work; today it's silently empty.
+	})
+	if err != nil {
+		return fmt.Errorf("target %q: materialize: %w", t.Name, err)
+	}
+
+	if err := st.RecordStart(ctx, store.StartParams{
+		Day:          day,
+		Seq:          inv.Seq,
+		CallableName: t.Name,
+		CallableKind: "target",
+		StartedAt:    time.Now().UTC(),
+		SourceFile:   t.Source.File,
+	}); err != nil {
+		return fmt.Errorf("target %q: record start: %w", t.Name, err)
+	}
+
+	res, runErr := runner.RunCallable(inv, runner.RunCallableOpts{
+		Stdout:     os.Stdout,
+		Stderr:     os.Stderr,
+		InheritEnv: true,
+	})
+
+	// Update the runs row regardless of outcome.
+	finishStatus := "ok"
+	exitCode := 0
+	if runErr != nil {
+		finishStatus = "error"
+	} else if res != nil && res.ExitCode != 0 {
+		finishStatus = "fail"
+		exitCode = res.ExitCode
+	}
+	if res != nil {
+		exitCode = res.ExitCode
+	}
+	_ = st.FinishRun(ctx, store.FinishParams{
+		Day:        day,
+		Seq:        inv.Seq,
+		FinishedAt: time.Now().UTC(),
+		Status:     finishStatus,
+		ExitCode:   exitCode,
+	})
+
+	if runErr != nil {
+		return fmt.Errorf("target %q failed: %w", t.Name, runErr)
+	}
+	if res != nil && res.ExitCode != 0 {
+		return fmt.Errorf("target %q failed (exit %d)", t.Name, res.ExitCode)
 	}
 	return nil
 }
