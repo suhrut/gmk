@@ -259,3 +259,96 @@ func IsLiteral(n Node) bool {
 
 // quote wraps a string with quotes, useful in error messages.
 func quote(s string) string { return fmt.Sprintf("%q", s) }
+
+// -----------------------------------------------------------------------------
+// Stage 3b node types
+// -----------------------------------------------------------------------------
+
+// FieldAccess is a `.field` postfix on an expression that yields a map.
+//
+// Example:
+//
+//	"${config.host}" -> FieldAccess{Inner: VarRef{config}, Field: "host"}
+//	"${user.address.city}" -> FieldAccess{
+//	  Inner: FieldAccess{Inner: VarRef{user}, Field: "address"},
+//	  Field: "city",
+//	}
+//
+// Field access is right-associative for parsing but left-evaluated:
+// the inner subtree is evaluated to a map, then Field is looked up.
+type FieldAccess struct {
+	P     Position
+	Inner Node
+	Field string
+}
+
+func (f *FieldAccess) Pos() Position  { return f.P }
+func (f *FieldAccess) String() string { return f.Inner.String() + "." + f.Field }
+
+// IndexAccess is a `[expr]` postfix on an expression that yields a
+// list or map.
+//
+// Examples:
+//
+//	"${hosts[0]}"     -> IndexAccess{Inner: VarRef{hosts}, Key: Literal(0)}
+//	"${cfg[key]}"     -> IndexAccess{Inner: VarRef{cfg},   Key: VarRef{key}}
+//	"${cfg[\"host\"]}" -> IndexAccess{Inner: VarRef{cfg},  Key: Literal("host")}
+//
+// At evaluation time, the Key expression is evaluated and used to index
+// into the Inner value via Value.Index.
+type IndexAccess struct {
+	P     Position
+	Inner Node
+	Key   Node
+}
+
+func (i *IndexAccess) Pos() Position  { return i.P }
+func (i *IndexAccess) String() string { return i.Inner.String() + "[" + i.Key.String() + "]" }
+
+// NamedCall is a function call with explicit kind prefix and (optionally)
+// named arguments. Used for callable functions (locally declared and
+// plugin-provided) where positional args alone would be ambiguous.
+//
+// Examples:
+//
+//	"${call:git-version()}"
+//	  -> NamedCall{Kind: "call", Name: "git-version", Args: nil}
+//
+//	"${call:render-tpl(src='Dockerfile.tmpl', vars=config)}"
+//	  -> NamedCall{
+//	       Kind: "call", Name: "render-tpl",
+//	       Args: [{Name: "src", Value: Literal{"Dockerfile.tmpl"}},
+//	              {Name: "vars", Value: VarRef{"config"}}],
+//	     }
+//
+// Note: the kind is captured for future extensibility (e.g. "tmpl:" or
+// "secret:" prefixes), but currently only "call" is recognized.
+// FuncCall remains the AST node for built-in function invocations like
+// upper(x), starts_with(s, prefix) — those are positional and namespaced
+// to the package's builtin set.
+type NamedCall struct {
+	P    Position
+	Kind string // typically "call"
+	Name string
+	Args []NamedArg
+}
+
+// NamedArg is one (name, value) pair in a NamedCall argument list.
+// A bare positional arg has Name == "".
+type NamedArg struct {
+	Name  string
+	Value Node
+}
+
+func (n *NamedCall) Pos() Position { return n.P }
+func (n *NamedCall) String() string {
+	parts := make([]string, len(n.Args))
+	for i, a := range n.Args {
+		if a.Name != "" {
+			parts[i] = a.Name + "=" + a.Value.String()
+		} else {
+			parts[i] = a.Value.String()
+		}
+	}
+	return n.Kind + ":" + n.Name + "(" + strings.Join(parts, ", ") + ")"
+}

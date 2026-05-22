@@ -1,0 +1,41 @@
+# examples/expressions/mixed_templates/build.yml
+#
+# Demonstrates: var values where ${...} expressions are interleaved with
+# literal text — the most common shape in real build files. Each value
+# is a template that mixes plain text and zero or more expressions.
+#
+# Stages exercised:    1, 3a
+# Stages compatible:   1, 2, 3a, 3b+
+#
+# Run:
+#   gmk run banner --file examples/expressions/mixed_templates/build.yml
+
+vars:
+  project: "gmk"
+  version: "0.3a"
+  arch: "amd64"
+
+  # All literal — no expressions.
+  pure_text: "just plain text"
+
+  # One expression embedded.
+  one_in:    "Project: ${project}"
+
+  # Multiple expressions, separated by literal text.
+  triplet:   "${project}-${version}-${arch}"
+
+  # Expression with modifier embedded in text.
+  with_mod:  "tag=${project}-${env:BUILD_TAG:-dev}"
+
+  # Expression that itself uses a pipeline, embedded in text.
+  banner:    "=== ${project | upper} v${version} ==="
+
+targets:
+  banner:
+    phony: true
+    run: |
+      echo "pure=${pure_text}"
+      echo "one=${one_in}"
+      echo "triplet=${triplet}"
+      echo "with_mod=${with_mod}"
+      echo "banner=${banner}"

@@ -58,7 +58,8 @@ func TestValue_AsString(t *testing.T) {
 		{NewFloat(3.14), "3.14"},
 		{NewBool(true), "true"},
 		{NewBool(false), "false"},
-		{NewList([]Value{NewString("a"), NewString("b")}), "[a, b]"},
+		// Stage 3b: lists serialize as JSON for predictable env-var bridging.
+		{NewList([]Value{NewString("a"), NewString("b")}), `["a","b"]`},
 		{NewList(nil), "[]"},
 	}
 	for _, tc := range cases {

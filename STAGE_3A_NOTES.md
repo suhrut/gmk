@@ -156,14 +156,121 @@ The two intentional behaviour changes:
   2. YAML tags (`!sh`, `!env`, etc.) on var values raise `ErrTaggedValue`
      instead of being silently dropped. Stage 3b will accept them.
 
+## Example suite (regression battery)
+
+The `examples/` tree is now a structured regression battery: 19
+`build.yml` files organised into 5 categories, each at depth 3
+(`examples/<category>/<feature>/build.yml`):
+
+```
+examples/
+├── basics/                      Stage 1/2 fundamentals
+│   ├── literals/                no expressions
+│   ├── single_ref/              one ${name}
+│   ├── nested_ref/              chained ${a} -> ${b} -> ${c} -> leaf
+│   ├── dollar_escape/           $$ literal dollar
+│   └── multi_block_vars/        vars + vars_1 + vars_2 decl order
+├── scoping/                     Stage 2 scope and includes
+│   ├── local_include/           ./relative.yml include
+│   ├── override/                child wins over included
+│   └── transitive/              A includes B includes C
+├── expressions/                 Stage 3a expression language
+│   ├── typed_refs/              ${env:X}, ${var:X}, ${ctx:X}
+│   ├── modifiers/               :-, :+, :?
+│   ├── pipelines/               | upper | trim | replace ...
+│   ├── functions/               every built-in exercised
+│   ├── comparisons/             == and !=
+│   └── mixed_templates/         text + ${ref} interleaved
+├── targets/                     target-level features
+│   ├── deps_chain/              4-step dep chain
+│   ├── env_block/               per-target env: + ${...} resolution
+│   ├── cwd/                     working dir (caught a real cli bug —
+│   │                            t.Cwd was being passed unresolved;
+│   │                            now fixed in cli/run.go)
+│   └── phony/                   phony targets
+└── hello/                       integration showcase (existing)
+```
+
+Each example documents the stages it exercises and the stages it must
+remain compatible with. They use only Stage 1/2/3a features and avoid
+anything that will land in 3b+, so they stay green as new stages ship.
+
+### Automated execution
+
+Two ways to run the whole battery, each addressing a different audience.
+
+#### 1. Go integration test (primary — for CI)
+
+`internal/integration/examples_test.go` walks the tree and asserts, for
+every `build.yml`:
+
+  1. **TestExamplesLoad** — parses cleanly through `load.Load`
+  2. **TestExamplesResolveAllVars** — every var resolves
+  3. **TestExamplesTargetsConsistent** — deps, env, cwd, run templates resolve
+  4. **TestExamplesShape** — has at least one target; var counts match
+  5. **TestExamplesRun** — *actually executes* every leaf target via
+     materialize + ScriptRunner, asserts exit 0. Catches bugs in the
+     execution path, not just parsing — caught the t.Cwd resolution bug
+     described above.
+
+That's **95 subtests across 5 test functions × 19 examples**, all green
+in the sandbox. Self-contained: no Makefile or built `gmk` binary
+required, runs with plain `go test ./internal/integration/...`.
+
+To add a new example: drop a `build.yml` under
+`examples/<category>/<feature>/`. It is picked up automatically. If
+your example references `${env:NAME}` without a `:-` default, add the
+var to `setExampleEnv()` so the test stays deterministic.
+
+#### 2. Makefile (secondary — for humans)
+
+A thin top-level `Makefile` wraps the common `go` invocations:
+
+```
+make build         — build ./gmk binary
+make test          — go test -race ./...        (all packages)
+make examples      — go test -race ./internal/integration/...
+make examples-run  — same, verbose, with shell output interleaved
+make vet           — go vet ./...
+make fmt           — gofmt -w -s .
+make clean         — remove ./gmk and .gmk-cache/ dirs under examples/
+```
+
+The Makefile is convenience only — every target is a single `go`
+invocation. Nothing in gmk *requires* `make`.
+
+### Why not eat our own dog food yet?
+
+The natural-feeling third option is a top-level `examples/build.yml`
+that uses gmk to run gmk's own examples. We deliberately don't do that
+in Stage 3a because the design is incomplete:
+
+  - Without **file targets** (Stage 5: declared `inputs:` / `outputs:`),
+    we can't model "build the gmk binary first, then run examples that
+    depend on it" — every dependency is phony, so caching is impossible
+    and the dep chain has no notion of "binary is up to date".
+  - Without **command-substitution / capture** (Stage 5: `!sh` for vars,
+    captured stdout), a meta-target can't iterate dynamically over
+    `find examples -name build.yml` and act on the result.
+  - The chicken-and-egg: running `gmk run examples --file build.yml`
+    requires gmk to already be on `$PATH` to run a build.yml that runs
+    gmk. Without file targets, we can't express "build it first".
+
+Stage 5 lands all three. At that point the Makefile shrinks to
+`run: gmk run all --file build.yml` and the example battery becomes a
+genuine self-hosting demonstration. The integration test still stays —
+it's the lower-level contract that the cli/orchestrator must honour,
+independent of which driver (cli, daemon, plugin) invokes it.
+
 ## How to verify on your machine
 
 ```bash
 tar xzf gmk-stage3a.tar.gz
 cd gmk-stage3a
 go mod tidy           # downloads goccy + spf13/cobra
-go test -race ./...   # should pass cleanly
-go build -o gmk ./cmd/gmk
+make test             # go test -race ./...
+make examples         # the regression battery only
+make build            # produces ./gmk
 ./gmk dryrun hello --file examples/hello/build.yml
 ./gmk run    hello --file examples/hello/build.yml
 ```

@@ -63,6 +63,13 @@ func DefaultFuncs() *FuncRegistry {
 	r.Register("default", fnDefault)
 	r.Register("coalesce", fnCoalesce)
 	r.Register("join", fnJoin)
+	// Stage 3b: structured-value helpers.
+	r.Register("keys", fnKeys)
+	r.Register("values", fnValues)
+	r.Register("first", fnFirst)
+	r.Register("last", fnLast)
+	r.Register("to_json", fnToJSON)
+	r.Register("from_json", fnFromJSON)
 	return r
 }
 
@@ -146,7 +153,7 @@ func fnToInt(args []Value) (Value, error) {
 	return NewInt(n), nil
 }
 
-// fnLen returns the length of a string or list.
+// fnLen returns the length of a string, list, or map.
 func fnLen(args []Value) (Value, error) {
 	if err := checkArity("len", args, 1); err != nil {
 		return NewNone(), err
@@ -156,6 +163,8 @@ func fnLen(args []Value) (Value, error) {
 		return NewInt(int64(len(args[0].Str))), nil
 	case ListKind:
 		return NewInt(int64(len(args[0].List))), nil
+	case MapKind:
+		return NewInt(int64(len(args[0].Map))), nil
 	case NoneKind:
 		return NewInt(0), nil
 	default:
@@ -248,4 +257,141 @@ func fnJoin(args []Value) (Value, error) {
 		parts[i] = it.AsString()
 	}
 	return NewString(strings.Join(parts, sep)), nil
+}
+
+// -----------------------------------------------------------------------------
+// Stage 3b builtins: structured-value introspection and JSON bridging
+// -----------------------------------------------------------------------------
+
+// fnKeys returns the keys of a map (sorted) or the indices of a list
+// (as integer strings, in order). For other kinds returns an error.
+//
+// Why sorted for maps: determinism for testing and for output that
+// callers may format. Callers that need insertion order should track
+// it separately (gmk doesn't preserve YAML insertion order through
+// the materialize phase yet).
+func fnKeys(args []Value) (Value, error) {
+	if err := checkArity("keys", args, 1); err != nil {
+		return NewNone(), err
+	}
+	v := args[0]
+	switch v.Kind {
+	case MapKind, ListKind:
+		ks := v.Keys()
+		items := make([]Value, len(ks))
+		for i, k := range ks {
+			items[i] = NewString(k)
+		}
+		return NewList(items), nil
+	case NoneKind:
+		return NewList(nil), nil
+	}
+	return NewNone(), fmt.Errorf("keys: cannot get keys of %s", v.Kind)
+}
+
+// fnValues returns the values of a map (in key-sorted order) or the
+// elements of a list (in order). For other kinds returns an error.
+func fnValues(args []Value) (Value, error) {
+	if err := checkArity("values", args, 1); err != nil {
+		return NewNone(), err
+	}
+	v := args[0]
+	switch v.Kind {
+	case MapKind:
+		ks := v.Keys()
+		out := make([]Value, len(ks))
+		for i, k := range ks {
+			out[i] = v.Map[k]
+		}
+		return NewList(out), nil
+	case ListKind:
+		// Return a copy so callers can't mutate via aliasing.
+		out := make([]Value, len(v.List))
+		copy(out, v.List)
+		return NewList(out), nil
+	case NoneKind:
+		return NewList(nil), nil
+	}
+	return NewNone(), fmt.Errorf("values: cannot get values of %s", v.Kind)
+}
+
+// fnFirst returns the first element of a list. Errors on empty list
+// or non-list argument. Useful in pipelines: ${hosts | first | upper}.
+func fnFirst(args []Value) (Value, error) {
+	if err := checkArity("first", args, 1); err != nil {
+		return NewNone(), err
+	}
+	v := args[0]
+	switch v.Kind {
+	case ListKind:
+		if len(v.List) == 0 {
+			return NewNone(), fmt.Errorf("first: empty list")
+		}
+		return v.List[0], nil
+	case StringKind:
+		if v.Str == "" {
+			return NewNone(), fmt.Errorf("first: empty string")
+		}
+		return NewString(string(v.Str[0])), nil
+	}
+	return NewNone(), fmt.Errorf("first: cannot get first of %s", v.Kind)
+}
+
+// fnLast returns the last element of a list (or last byte of a string).
+func fnLast(args []Value) (Value, error) {
+	if err := checkArity("last", args, 1); err != nil {
+		return NewNone(), err
+	}
+	v := args[0]
+	switch v.Kind {
+	case ListKind:
+		if len(v.List) == 0 {
+			return NewNone(), fmt.Errorf("last: empty list")
+		}
+		return v.List[len(v.List)-1], nil
+	case StringKind:
+		if v.Str == "" {
+			return NewNone(), fmt.Errorf("last: empty string")
+		}
+		return NewString(string(v.Str[len(v.Str)-1])), nil
+	}
+	return NewNone(), fmt.Errorf("last: cannot get last of %s", v.Kind)
+}
+
+// fnToJSON serializes a value to a JSON-encoded string. Useful for
+// passing structured values through string-typed env vars or for
+// debug-printing.
+//
+// The output uses compact JSON (no extra whitespace) so it round-trips
+// cleanly through env vars and shell quoting.
+func fnToJSON(args []Value) (Value, error) {
+	if err := checkArity("to_json", args, 1); err != nil {
+		return NewNone(), err
+	}
+	// Value.AsString already produces JSON for structured types, but
+	// for scalars (string, int, bool) AsString gives bare text. We
+	// want strict JSON for scalars too — e.g. to_json("x") -> "\"x\"".
+	js, err := jsonMarshalCompact(args[0].ToJSON())
+	if err != nil {
+		return NewNone(), fmt.Errorf("to_json: %w", err)
+	}
+	return NewString(js), nil
+}
+
+// fnFromJSON parses a JSON-encoded string into a typed Value. Inverse
+// of to_json. Useful for receiving structured data from env vars or
+// command-line args that arrive as strings.
+//
+// Integer JSON numbers are decoded as IntKind (using json.Decoder with
+// UseNumber to preserve int-vs-float).
+func fnFromJSON(args []Value) (Value, error) {
+	if err := checkArity("from_json", args, 1); err != nil {
+		return NewNone(), err
+	}
+	s := args[0].AsString()
+	v, err := jsonUnmarshalToValue(s)
+	if err != nil {
+		return NewNone(), fmt.Errorf("from_json: %w", err)
+	}
+	return v, nil
 }

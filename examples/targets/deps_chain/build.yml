@@ -1,0 +1,40 @@
+# examples/targets/deps_chain/build.yml
+#
+# Demonstrates: a dependency chain. Running `final` triggers prep, which
+# triggers compile, which triggers fetch. The DAG runner walks deps in
+# topological order so each prerequisite runs before its dependent.
+#
+#   fetch -> compile -> prep -> final
+#
+# Stages exercised:    1
+# Stages compatible:   1, 2, 3a, 3b+
+#
+# Run:
+#   gmk run final --file examples/targets/deps_chain/build.yml
+
+vars:
+  pkg: "hello-pkg"
+
+targets:
+  fetch:
+    phony: true
+    run: |
+      echo "[fetch] retrieving ${pkg}"
+
+  compile:
+    phony: true
+    deps: [fetch]
+    run: |
+      echo "[compile] building ${pkg}"
+
+  prep:
+    phony: true
+    deps: [compile]
+    run: |
+      echo "[prep] staging ${pkg}"
+
+  final:
+    phony: true
+    deps: [prep]
+    run: |
+      echo "[final] done with ${pkg}"

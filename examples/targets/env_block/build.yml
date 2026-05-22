@@ -1,0 +1,29 @@
+# examples/targets/env_block/build.yml
+#
+# Demonstrates: per-target `env:` block. Each entry becomes a shell env
+# var visible to that target's `run:` script. Values themselves go
+# through expression resolution.
+#
+# Stages exercised:    1, 3a
+# Stages compatible:   1, 2, 3a, 3b+
+#
+# Run:
+#   gmk run show_env --file examples/targets/env_block/build.yml
+
+vars:
+  app_name: "myapp"
+  app_ver: "1.0.0"
+
+targets:
+  show_env:
+    phony: true
+    env:
+      APP_NAME: "${app_name}"
+      APP_VERSION: "${app_ver}"
+      BUILD_USER: "${env:USER:-anonymous}"
+      FULL_ID: "${app_name}-${app_ver}"
+    run: |
+      echo "APP_NAME=$APP_NAME"
+      echo "APP_VERSION=$APP_VERSION"
+      echo "BUILD_USER=$BUILD_USER"
+      echo "FULL_ID=$FULL_ID"

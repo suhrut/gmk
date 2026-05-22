@@ -1,0 +1,22 @@
+# examples/basics/single_ref/build.yml
+#
+# Demonstrates: single ${name} substitution. Each var references one other
+# var directly. Mixes literal and ref-bearing vars.
+#
+# Stages exercised:    1
+# Stages compatible:   1, 2, 3a, 3b+
+#
+# Run:
+#   gmk run announce --file examples/basics/single_ref/build.yml
+
+vars:
+  name: "gmk"
+  intro: "Welcome to ${name}"
+  outro: "Goodbye from ${name}"
+
+targets:
+  announce:
+    phony: true
+    run: |
+      echo "${intro}"
+      echo "${outro}"

@@ -49,9 +49,142 @@ type Project struct {
 	// Includes. Target-level scopes (S4) will be children of this.
 	RootScope *Scope
 
+	// Functions maps a function name to its definition. Stage 3b: functions
+	// are first-class callables alongside targets — they share the
+	// prelude/body shape but are invoked via ${call:name(...)} or
+	// `gmk call name`. Targets in this stage compile down to functions
+	// with a default invocation path; functions are a strict superset.
+	//
+	// The same name space rules apply: function names must be unique across
+	// the project (no shadowing across include files in this stage).
+	Functions map[string]*Function
+
+	// FunctionOrder preserves declaration order from YAML, for deterministic
+	// listing in `gmk list` and `gmk doc` output.
+	FunctionOrder []string
+
+	// Languages maps a user-defined language name to its interpreter
+	// configuration. The six built-in languages (bash, sh, python, ruby,
+	// node, perl) are registered at runtime in materialize; the YAML
+	// `languages:` block lets a project add custom entries (e.g. zsh, lua,
+	// or a wrapper script).
+	//
+	// Stage 3b: each language is just {interpreter: string, args: []string}.
+	// Stage 3c may extend with per-language strict-mode preludes and other
+	// options.
+	Languages map[string]*Language
+
 	// Reserved for later stages:
 	//
 	//   Hash string  // S6: sha256 of normalized IR, for cache key
+}
+
+// Function is a callable defined in YAML. Functions share the prelude/body
+// shape with Targets and dispatch through the same runner. The distinction:
+//
+//   - A Target is invoked by `gmk run <name>` (or as a dep of another
+//     target). It produces side effects; its result value (if any) is
+//     usually informational.
+//   - A Function is invoked by `gmk call <name>` (or from inside another
+//     callable via ${call:name(...)}). It's expected to produce a result
+//     Value that callers can consume.
+//
+// Internally both compile down to the same Callable representation in
+// materialize; this split exists at the IR level only to preserve
+// declaration intent.
+//
+// Stage 3b: functions support typed parameters with defaults, a prelude
+// (declarative, gmk-time expressions), and a body (run-time script in
+// any supported language). The result is whatever the body writes to
+// $GMK_RESULT as JSON.
+type Function struct {
+	// Name is the function's identifier (used by gmk call and ${call:}).
+	Name string
+
+	// Source is the file:line:column of the function's declaration.
+	Source SourceLoc
+
+	// Params declares the function's parameters in order. Empty for
+	// zero-arg functions.
+	Params []FunctionParam
+
+	// Result documents what the function returns. Stage 3b: type and
+	// description only; no enforcement. Stage 4 may add validation.
+	Result *FunctionResult
+
+	// Prelude is an ordered map of name->expression evaluated at gmk-time
+	// (before the body runs), populating the prelude.json file the body
+	// reads. Names appear in declaration order; later names may reference
+	// earlier ones.
+	Prelude []PreludeEntry
+
+	// Run is the body script as written in YAML. May be empty for a
+	// function that returns purely from its prelude (a pure-data function).
+	Run string
+
+	// Lang names the interpreter for Run. Defaults to "bash" when Run
+	// is non-empty.
+	Lang string
+
+	// Env is extra environment variables to expose to the body, in
+	// addition to the standard GMK_ARGS, GMK_PRELUDE, GMK_RESULT.
+	Env map[string]string
+
+	// Cwd is the working directory for the body.
+	Cwd string
+
+	// Doc is the user-supplied doc string from the YAML, surfaced by
+	// `gmk doc <name>` and `gmk list --verbose`. Empty if not provided.
+	Doc string
+}
+
+// FunctionParam declares one parameter of a Function. Stage 3b supports
+// six types: string, int, float, bool, list, map — mirroring the Value
+// lattice. Default is the value used when the caller omits the arg;
+// nil means the param is required.
+type FunctionParam struct {
+	Name    string
+	Type    string // string|int|float|bool|list|map
+	Default *expr.Node
+	Doc     string
+}
+
+// FunctionResult documents what a function returns. No enforcement in
+// Stage 3b; surfaced by `gmk doc`.
+type FunctionResult struct {
+	Type string // string|int|float|bool|list|map|none
+	Doc  string
+}
+
+// PreludeEntry is one (name, expression) pair from a function's prelude.
+// Order is preserved so later entries can reference earlier ones.
+type PreludeEntry struct {
+	Name   string
+	Expr   expr.Node
+	Source SourceLoc
+}
+
+// Language describes an interpreter for the body of a callable.
+// The six built-ins (bash, sh, python, ruby, node, perl) are baked into
+// materialize; user-defined languages come through Project.Languages.
+type Language struct {
+	// Name is the language identifier used in `lang:` fields.
+	Name string
+
+	// Interpreter is the binary name or absolute path. Resolved via
+	// $PATH at materialize time if not absolute.
+	Interpreter string
+
+	// Args are prepended to the interpreter's argv before the script path.
+	// For example, "-eu -o pipefail" for bash strict mode.
+	Args []string
+
+	// Ext is the file extension to use when writing the script to disk.
+	// Defaults to ".sh"; some interpreters care (.py, .rb, .js).
+	Ext string
+
+	// Source is the YAML location, for diagnostics.
+	Source SourceLoc
 }
 
 // Scope is a lexical region in which vars are declared and resolved.
@@ -267,6 +400,20 @@ type Target struct {
 	// Stage 2 always runs every requested target; Phony is recorded but
 	// not yet enforced.
 	Phony bool
+
+	// Prelude is the target's gmk-time-evaluated declarative bindings,
+	// added in Stage 3b. Each entry is evaluated before the body runs
+	// and the merged result is written to $GMK_PRELUDE as JSON. Order
+	// is preserved so later entries can reference earlier ones via
+	// ${name} substitution.
+	//
+	// Targets that don't declare a prelude have len(Prelude) == 0; the
+	// runner writes an empty JSON object to $GMK_PRELUDE in that case.
+	Prelude []PreludeEntry
+
+	// Doc is the user-supplied doc string surfaced by `gmk doc <name>`
+	// and `gmk list --verbose`. Empty when not provided.
+	Doc string
 
 	// Reserved for later stages:
 	//

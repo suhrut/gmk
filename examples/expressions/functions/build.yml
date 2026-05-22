@@ -1,0 +1,76 @@
+# examples/expressions/functions/build.yml
+#
+# Demonstrates: every built-in function available in Stage 3a.
+#
+#   String case:   upper, lower
+#   Whitespace:    trim, trim_left, trim_right
+#   Coercion:      to_string, to_int
+#   Length:        len
+#   Predicates:    starts_with, ends_with, contains
+#   Substitution:  replace
+#   Defaults:      default, coalesce
+#   Joining:       join
+#
+# Stages exercised:    3a
+# Stages compatible:   3a, 3b+
+#
+# Run:
+#   gmk run all_funcs --file examples/expressions/functions/build.yml
+
+vars:
+  text: "Hello, World"
+  padded: "   spaces   "
+  numeric: "42"
+
+  # case
+  upcase:   "${upper(text)}"
+  downcase: "${lower(text)}"
+
+  # whitespace
+  tight:    "${trim(padded)}"
+  ltrim:    "${trim_left(padded)}"
+  rtrim:    "${trim_right(padded)}"
+
+  # coercion
+  as_str:   "${to_string(numeric)}"
+  as_int:   "${to_int(numeric)}"
+
+  # length
+  size:     "${len(text)}"
+
+  # predicates (booleans coerced to "true"/"false" when stringified)
+  has_h:    "${starts_with(text, \"Hello\")}"
+  has_d:    "${ends_with(text, \"World\")}"
+  has_or:   "${contains(text, \"or\")}"
+
+  # substitution
+  swapped:  "${replace(text, \"World\", \"gmk\")}"
+
+  # defaults
+  default1: "${default(\"\", \"fallback\")}"
+  default2: "${default(text, \"unused\")}"
+  picked:   "${coalesce(\"\", \"\", \"third-wins\")}"
+
+  # joining
+  joined:   "${join(\",\", \"a\", \"b\", \"c\")}"
+
+targets:
+  all_funcs:
+    phony: true
+    run: |
+      echo "upper=${upcase}"
+      echo "lower=${downcase}"
+      echo "trim=[${tight}]"
+      echo "trim_left=[${ltrim}]"
+      echo "trim_right=[${rtrim}]"
+      echo "to_string=${as_str}"
+      echo "to_int=${as_int}"
+      echo "len=${size}"
+      echo "starts_with=${has_h}"
+      echo "ends_with=${has_d}"
+      echo "contains=${has_or}"
+      echo "replace=${swapped}"
+      echo "default-empty=${default1}"
+      echo "default-set=${default2}"
+      echo "coalesce=${picked}"
+      echo "join=${joined}"

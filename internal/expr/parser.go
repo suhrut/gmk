@@ -295,9 +295,63 @@ func (p *parser) parsePrimaryWithModifier() (Node, error) {
 	return &Modifier{P: prim.Pos(), Inner: prim, Kind: kind, Arg: arg}, nil
 }
 
-// parsePrimary parses a primary: literal, ref, typed ref, function call,
-// or parenthesized expression.
+// parsePrimary parses a primary atom (literal, ref, typed ref, function
+// call, or parenthesized expression), then applies any postfix accessors
+// — dot-access (.field) or bracket-indexing ([key]) — in left-to-right
+// order. Postfix operators bind tighter than modifiers, pipes, or
+// comparisons, so they're applied here at the atom level.
 func (p *parser) parsePrimary() (Node, error) {
+	node, err := p.parsePrimaryAtom()
+	if err != nil {
+		return nil, err
+	}
+	// Apply any postfix accessors: .field or [key].
+	for {
+		tok, err := p.lex.Peek()
+		if err != nil {
+			return nil, err
+		}
+		switch tok.Type {
+		case tokDot:
+			if _, err := p.lex.Next(); err != nil {
+				return nil, err
+			}
+			fieldTok, err := p.lex.Next()
+			if err != nil {
+				return nil, err
+			}
+			if fieldTok.Type != tokIdent {
+				return nil, NewParseError(fieldTok.Pos,
+					"expected field name after '.', got %s", fieldTok.Type)
+			}
+			node = &FieldAccess{P: node.Pos(), Inner: node, Field: fieldTok.Value}
+		case tokLBrack:
+			if _, err := p.lex.Next(); err != nil {
+				return nil, err
+			}
+			keyExpr, err := p.parsePipeline()
+			if err != nil {
+				return nil, err
+			}
+			closer, err := p.lex.Next()
+			if err != nil {
+				return nil, err
+			}
+			if closer.Type != tokRBrack {
+				return nil, NewParseError(closer.Pos,
+					"expected ']' after index expression, got %s", closer.Type)
+			}
+			node = &IndexAccess{P: node.Pos(), Inner: node, Key: keyExpr}
+		default:
+			return node, nil
+		}
+	}
+}
+
+// parsePrimaryAtom parses a single atom WITHOUT postfix accessors.
+// This is the original parsePrimary logic, factored out so parsePrimary
+// can wrap it with the postfix-accessor loop.
+func (p *parser) parsePrimaryAtom() (Node, error) {
 	tok, err := p.lex.Next()
 	if err != nil {
 		return nil, err
@@ -345,8 +399,13 @@ func (p *parser) parsePrimary() (Node, error) {
 //
 //	IDENT             -> VarRef
 //	IDENT ":" path    -> TypedRef
+//	IDENT ":" IDENT "(" named_args ")" -> NamedCall (Stage 3b)
 //	IDENT "(" args ")"-> FuncCall
-//	IDENT (bare keyword false in some places handled by caller)
+//
+// The distinction between TypedRef and NamedCall: if after the kind:name
+// the next token is "(", it's a function-style call (NamedCall). The
+// "call:" kind is the primary use case but the syntax is open to other
+// kinds in future stages.
 func (p *parser) parseIdentExpr(idTok Token) (Node, error) {
 	next, err := p.lex.Peek()
 	if err != nil {
@@ -354,17 +413,64 @@ func (p *parser) parseIdentExpr(idTok Token) (Node, error) {
 	}
 	switch next.Type {
 	case tokColon:
-		// Typed ref. Consume the colon then read a dotted path.
+		// Either a typed ref or a named call. Consume the colon, then
+		// look at what follows.
 		if _, err := p.lex.Next(); err != nil {
 			return nil, err
 		}
-		path, err := p.readPath()
+		// Read the first identifier of the path/name.
+		nameTok, err := p.lex.Next()
 		if err != nil {
 			return nil, err
 		}
+		if nameTok.Type != tokIdent {
+			return nil, NewParseError(nameTok.Pos,
+				"expected identifier after ':', got %s", nameTok.Type)
+		}
+		// Peek to decide: '(' means NamedCall, '.' means continued path
+		// (TypedRef), anything else means end of TypedRef.
+		peek, err := p.lex.Peek()
+		if err != nil {
+			return nil, err
+		}
+		if peek.Type == tokLParen {
+			// NamedCall: kind:name(...)
+			args, err := p.parseNamedCallArgs()
+			if err != nil {
+				return nil, err
+			}
+			return &NamedCall{
+				P:    idTok.Pos,
+				Kind: idTok.Value,
+				Name: nameTok.Value,
+				Args: args,
+			}, nil
+		}
+		// Continue reading TypedRef path: ident ("." ident)*
+		path := nameTok.Value
+		for {
+			next, err := p.lex.Peek()
+			if err != nil {
+				return nil, err
+			}
+			if next.Type != tokDot {
+				break
+			}
+			if _, err := p.lex.Next(); err != nil {
+				return nil, err
+			}
+			seg, err := p.lex.Next()
+			if err != nil {
+				return nil, err
+			}
+			if seg.Type != tokIdent {
+				return nil, NewParseError(seg.Pos, "expected identifier after '.', got %s", seg.Type)
+			}
+			path += "." + seg.Value
+		}
 		return &TypedRef{P: idTok.Pos, Kind: idTok.Value, Path: path}, nil
 	case tokLParen:
-		// Function call.
+		// Plain function call.
 		args, err := p.parseCallArgs()
 		if err != nil {
 			return nil, err
@@ -373,6 +479,114 @@ func (p *parser) parseIdentExpr(idTok Token) (Node, error) {
 	}
 	// Plain VarRef.
 	return &VarRef{P: idTok.Pos, Name: idTok.Value}, nil
+}
+
+// parseNamedCallArgs parses "(" named-or-positional args ")" for a
+// NamedCall. Each arg is either:
+//
+//	IDENT "=" expr   — named
+//	expr              — positional (Name=="")
+//
+// Mixing is allowed but positional args must come before named ones,
+// matching Python/Go convention. Trailing comma allowed.
+func (p *parser) parseNamedCallArgs() ([]NamedArg, error) {
+	openTok, err := p.lex.Next()
+	if err != nil {
+		return nil, err
+	}
+	if openTok.Type != tokLParen {
+		return nil, NewParseError(openTok.Pos, "expected '(' for call, got %s", openTok.Type)
+	}
+	var args []NamedArg
+	// Empty arg list.
+	peek, err := p.lex.Peek()
+	if err != nil {
+		return nil, err
+	}
+	if peek.Type == tokRParen {
+		if _, err := p.lex.Next(); err != nil {
+			return nil, err
+		}
+		return args, nil
+	}
+	sawNamed := false
+	for {
+		// Detect "ident = expr" vs bare expr by looking 2 tokens ahead.
+		// (We can't easily peek 2; we save state and try parsing an
+		// ident-assign pattern, falling back to expression parsing.)
+		first, err := p.lex.Peek()
+		if err != nil {
+			return nil, err
+		}
+		var arg NamedArg
+		if first.Type == tokIdent {
+			// Save position so we can rewind if it's not a named arg.
+			savedPos := p.lex.SavePos()
+			_, _ = p.lex.Next() // consume ident
+			next, err := p.lex.Peek()
+			if err != nil {
+				return nil, err
+			}
+			if next.Type == tokAssign {
+				// Named arg.
+				_, _ = p.lex.Next() // consume =
+				val, err := p.parsePipeline()
+				if err != nil {
+					return nil, err
+				}
+				arg = NamedArg{Name: first.Value, Value: val}
+				sawNamed = true
+			} else {
+				// Rewind and parse as positional expression.
+				p.lex.RestorePos(savedPos)
+				if sawNamed {
+					return nil, NewParseError(first.Pos,
+						"positional argument %q cannot follow named arguments",
+						first.Value)
+				}
+				val, err := p.parsePipeline()
+				if err != nil {
+					return nil, err
+				}
+				arg = NamedArg{Value: val}
+			}
+		} else {
+			// Bare expression (not an ident token).
+			if sawNamed {
+				return nil, NewParseError(first.Pos,
+					"positional argument cannot follow named arguments")
+			}
+			val, err := p.parsePipeline()
+			if err != nil {
+				return nil, err
+			}
+			arg = NamedArg{Value: val}
+		}
+		args = append(args, arg)
+		sep, err := p.lex.Next()
+		if err != nil {
+			return nil, err
+		}
+		switch sep.Type {
+		case tokRParen:
+			return args, nil
+		case tokComma:
+			// Allow trailing comma.
+			next, err := p.lex.Peek()
+			if err != nil {
+				return nil, err
+			}
+			if next.Type == tokRParen {
+				if _, err := p.lex.Next(); err != nil {
+					return nil, err
+				}
+				return args, nil
+			}
+			continue
+		default:
+			return nil, NewParseError(sep.Pos, "expected ',' or ')', got %s", sep.Type)
+		}
+	}
 }
 
 // readPath reads IDENT ("." IDENT)* and returns the joined form.

@@ -114,7 +114,14 @@ func runOneTarget(out io.Writer, project *ir.Project, t *ir.Target) error {
 		input["env"] = resolvedEnv
 	}
 	if t.Cwd != "" {
-		input["cwd"] = t.Cwd
+		// Resolve ${...} in cwd against the project's root scope, matching
+		// how env values are handled above. Without this, a YAML cwd of
+		// "${work_dir}" would be passed literally to exec and fail ENOENT.
+		resolvedCwd, err := resolve.ResolveStringInScope(t.Cwd, project.RootScope)
+		if err != nil {
+			return fmt.Errorf("target %q: cwd resolution: %w", t.Name, err)
+		}
+		input["cwd"] = resolvedCwd
 	}
 
 	_, err = r.Run(input)

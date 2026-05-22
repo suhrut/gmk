@@ -1,0 +1,29 @@
+# examples/scoping/override/build.yml
+#
+# Demonstrates: a child file can redefine a var from an included file.
+# When resolving, scope.Lookup checks the local scope BEFORE walking
+# into includes — so the local definition wins.
+#
+# base/defaults.yml provides `mode: production`.
+# This file overrides it with `mode: development`.
+#
+# Stages exercised:    2
+# Stages compatible:   2, 3a, 3b+
+#
+# Run:
+#   gmk run show --file examples/scoping/override/build.yml
+
+includes:
+  - "./base/defaults.yml"
+
+vars:
+  # Locally overrides base/defaults.yml's value.
+  mode: "development"
+  # base_only stays inherited from base/defaults.yml.
+
+targets:
+  show:
+    phony: true
+    run: |
+      echo "mode=${mode}"               # development (overridden)
+      echo "base_only=${base_only}"     # from base

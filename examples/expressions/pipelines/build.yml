@@ -1,0 +1,36 @@
+# examples/expressions/pipelines/build.yml
+#
+# Demonstrates: pipeline operator | chains a value through stages,
+# left-to-right like a shell pipeline. The piped value goes as the
+# FIRST argument to the next function.
+#
+# Stages exercised:    3a
+# Stages compatible:   3a, 3b+
+#
+# Run:
+#   gmk run pipe --file examples/expressions/pipelines/build.yml
+
+vars:
+  noisy: "   Hello, World   "
+
+  # Single-stage pipeline.
+  shouted: "${noisy | upper}"
+
+  # Two-stage: trim spaces then upper.
+  cleaned: "${noisy | trim | upper}"
+
+  # Three-stage chain.
+  loud: "${noisy | trim | upper | replace(\",\", \" --\")}"
+
+  # Pipeline that ends in a string-converting stage.
+  counted: "${noisy | trim | len | to_string}"
+
+targets:
+  pipe:
+    phony: true
+    run: |
+      echo "noisy=[${noisy}]"
+      echo "shouted=[${shouted}]"
+      echo "cleaned=[${cleaned}]"
+      echo "loud=[${loud}]"
+      echo "counted=[${counted}]"

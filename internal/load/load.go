@@ -134,6 +134,16 @@ func loadWithChain(absPath string, chain []string) (*ir.Project, error) {
 				return nil, err
 			}
 
+		case entry.Key == "functions":
+			if err := loadFunctions(p, entry, absPath); err != nil {
+				return nil, err
+			}
+
+		case entry.Key == "languages":
+			if err := loadLanguages(p, entry, absPath); err != nil {
+				return nil, err
+			}
+
 		default:
 			// validateTopLevelKeys should have caught this; defensive.
 			return nil, fmt.Errorf("load %s:%d:%d: unknown top-level key %q",
@@ -165,6 +175,8 @@ func emptyProject(absPath string) *ir.Project {
 		SourcePath: absPath,
 		Root:       filepath.Dir(absPath),
 		Targets:    make(map[string]*ir.Target),
+		Functions:  make(map[string]*ir.Function), // Stage 3b
+		Languages:  make(map[string]*ir.Language), // Stage 3b
 	}
 	p.RootScope = &ir.Scope{
 		Path:     "/",
@@ -277,6 +289,8 @@ func loadTarget(kv yamlMapEntry, file string) (*ir.Target, error) {
 	allowed := map[string]bool{
 		"run": true, "lang": true, "deps": true,
 		"env": true, "cwd": true, "phony": true,
+		"prelude": true, "doc": true, // Stage 3b
+		"script": true, // Stage 3b: alias for "run"
 	}
 	for _, te := range body.Entries {
 		if !allowed[te.Key] {
@@ -284,10 +298,15 @@ func loadTarget(kv yamlMapEntry, file string) (*ir.Target, error) {
 				file, te.KeyLine, te.KeyCol, name, te.Key)
 		}
 		switch te.Key {
-		case "run":
+		case "run", "script":
 			s, err := te.Value.AsString()
 			if err != nil {
-				return nil, fmt.Errorf("load %s: target %q.run: %w", file, name, err)
+				return nil, fmt.Errorf("load %s: target %q.%s: %w", file, name, te.Key, err)
+			}
+			if t.Run != "" {
+				return nil, fmt.Errorf("load %s:%d:%d: target %q: "+
+					"cannot set both 'run' and 'script' — pick one",
+					file, te.KeyLine, te.KeyCol, name)
 			}
 			t.Run = s
 		case "lang":
@@ -337,6 +356,18 @@ func loadTarget(kv yamlMapEntry, file string) (*ir.Target, error) {
 				return nil, fmt.Errorf("load %s: target %q.phony: %w", file, name, err)
 			}
 			t.Phony = b
+		case "prelude":
+			pre, err := loadPrelude(te.Value, file, "target "+name)
+			if err != nil {
+				return nil, err
+			}
+			t.Prelude = pre
+		case "doc":
+			s, err := te.Value.AsString()
+			if err != nil {
+				return nil, fmt.Errorf("load %s: target %q.doc: %w", file, name, err)
+			}
+			t.Doc = s
 		}
 	}
 
@@ -419,8 +450,8 @@ func isVarsBlockKey(key string) bool {
 	return true
 }
 
-// validateTopLevelKeys enforces the Stage 3a closed schema: only known
-// top-level keys are allowed.
+// validateTopLevelKeys enforces the closed schema: only known top-level
+// keys are allowed.
 func validateTopLevelKeys(topMap *yamlMap, source string) error {
 	seen := make(map[string]bool, len(topMap.Entries))
 	for _, e := range topMap.Entries {
@@ -431,14 +462,15 @@ func validateTopLevelKeys(topMap *yamlMap, source string) error {
 		seen[e.Key] = true
 
 		switch e.Key {
-		case "includes", "targets", "vars":
+		case "includes", "targets", "vars",
+			"functions", "languages": // Stage 3b additions
 			continue
 		}
 		if isVarsBlockKey(e.Key) {
 			continue
 		}
 		return fmt.Errorf("load %s:%d:%d: unknown top-level key %q "+
-			"(Stage 3a accepts: includes, vars, vars_N, targets)",
+			"(accepted: includes, vars, vars_N, targets, functions, languages)",
 			source, e.KeyLine, e.KeyCol, e.Key)
 	}
 	return nil

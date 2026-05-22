@@ -1,0 +1,26 @@
+# examples/scoping/local_include/build.yml
+#
+# Demonstrates: ./relative include. lib/shared.yml exposes shared_var;
+# this file references it as if it were defined locally — that's how
+# scope.Lookup walks the include chain.
+#
+# Stages exercised:    2
+# Stages compatible:   2, 3a, 3b+
+#
+# Run:
+#   gmk run greet --file examples/scoping/local_include/build.yml
+
+includes:
+  - "./lib/shared.yml"
+
+vars:
+  local_var: "local-value"
+  combined: "${shared_var}+${local_var}"
+
+targets:
+  greet:
+    phony: true
+    run: |
+      echo "shared=${shared_var}"
+      echo "local=${local_var}"
+      echo "combined=${combined}"

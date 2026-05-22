@@ -19,11 +19,14 @@ const (
 	tokFloat   // decimal with .
 	tokLParen  // (
 	tokRParen  // )
+	tokLBrack  // [   (Stage 3b: index access)
+	tokRBrack  // ]
 	tokColon   // :
 	tokDot     // .
 	tokPipe    // |
 	tokEq      // ==
 	tokNeq     // !=
+	tokAssign  // =   (Stage 3b: named call args, e.g. fn(key=val))
 	tokComma   // ,
 	tokModDef  // :-   (default modifier)
 	tokModReq  // :?   (required modifier)
@@ -48,6 +51,10 @@ func (t TokenType) String() string {
 		return "("
 	case tokRParen:
 		return ")"
+	case tokLBrack:
+		return "["
+	case tokRBrack:
+		return "]"
 	case tokColon:
 		return ":"
 	case tokDot:
@@ -58,6 +65,8 @@ func (t TokenType) String() string {
 		return "=="
 	case tokNeq:
 		return "!="
+	case tokAssign:
+		return "="
 	case tokComma:
 		return ","
 	case tokModDef:
@@ -144,6 +153,19 @@ func (l *Lexer) Next() (Token, error) {
 	return t, nil
 }
 
+// SavePos returns an opaque cursor position that can be passed to
+// RestorePos to rewind the lexer. Used by the parser when it needs
+// multi-token lookahead — e.g. distinguishing "ident = expr" (named
+// arg) from "expr" (positional arg) in a NamedCall arg list.
+//
+// The implementation is cheap (just the cursor index) because tokens
+// are buffered in l.tokens; rewinding the cursor doesn't lose them.
+func (l *Lexer) SavePos() int { return l.cursor }
+
+// RestorePos rewinds the lexer to a previously-saved position. Tokens
+// past the new cursor stay buffered and will be re-emitted by Peek/Next.
+func (l *Lexer) RestorePos(c int) { l.cursor = c }
+
 // ReadRawToEnd returns whatever raw text remains in the input, advancing
 // the lexer to EOF. Used by the parser to capture modifier arguments
 // (:-default, :?msg, :+alt) as literal text up to the closing brace
@@ -176,6 +198,12 @@ func (l *Lexer) advance() (Token, error) {
 	case c == ')':
 		l.pos++
 		return Token{Type: tokRParen, Value: ")", Pos: startPos}, nil
+	case c == '[':
+		l.pos++
+		return Token{Type: tokLBrack, Value: "[", Pos: startPos}, nil
+	case c == ']':
+		l.pos++
+		return Token{Type: tokRBrack, Value: "]", Pos: startPos}, nil
 	case c == ',':
 		l.pos++
 		return Token{Type: tokComma, Value: ",", Pos: startPos}, nil
@@ -207,7 +235,9 @@ func (l *Lexer) advance() (Token, error) {
 			l.pos += 2
 			return Token{Type: tokEq, Value: "==", Pos: startPos}, nil
 		}
-		return Token{}, NewParseError(startPos, "unexpected '='; did you mean '=='?")
+		// Single '=' is used for named call args: fn(key=value).
+		l.pos++
+		return Token{Type: tokAssign, Value: "=", Pos: startPos}, nil
 	case c == '!':
 		if l.pos+1 < len(l.src) && l.src[l.pos+1] == '=' {
 			l.pos += 2
@@ -303,10 +333,25 @@ func (l *Lexer) readNumber(startPos Position) (Token, error) {
 	return Token{Type: tokInt, Value: text, Pos: startPos}, nil
 }
 
-// readIdent reads an identifier or a keyword (true, false).
+// readIdent reads an identifier or a keyword (true, false). Identifiers
+// allow internal hyphens (e.g. "git-version") but a hyphen must be
+// followed by an identifier character; "x-" alone reads only "x" and
+// leaves the "-" for the next lexer call.
 func (l *Lexer) readIdent(startPos Position) (Token, error) {
 	start := l.pos
-	for l.pos < len(l.src) && isIdentCont(l.src[l.pos]) {
+	for l.pos < len(l.src) {
+		c := l.src[l.pos]
+		if c == '-' {
+			// Lookahead: only consume the '-' if followed by an ident char.
+			if l.pos+1 >= len(l.src) || !isIdentStartOrDigit(l.src[l.pos+1]) {
+				break
+			}
+			l.pos++
+			continue
+		}
+		if !isIdentCont(c) {
+			break
+		}
 		l.pos++
 	}
 	text := l.src[start:l.pos]
@@ -319,12 +364,26 @@ func (l *Lexer) readIdent(startPos Position) (Token, error) {
 	return Token{Type: tokIdent, Value: text, Pos: startPos}, nil
 }
 
+// isIdentStartOrDigit is the set of chars that may follow a hyphen
+// inside an identifier (alpha/underscore or digit). Used by readIdent
+// to decide whether a `-` is part of the current ident or terminates it.
+func isIdentStartOrDigit(c byte) bool {
+	return isIdentStart(c) || (c >= '0' && c <= '9')
+}
+
 func isIdentStart(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
 }
 
+// isIdentCont allows hyphens AFTER the first character so identifiers
+// like "git-version", "render-tpl", and target names can be lexed as
+// single tokens. Identifiers cannot START with '-' (which would be
+// ambiguous with negative numbers). Within an identifier, a hyphen
+// must be followed by another identifier char — we enforce this in
+// readIdent so "x-1" still lexes as "x-1" (legal) but "x-" alone
+// terminates after "x".
 func isIdentCont(c byte) bool {
-	return isIdentStart(c) || (c >= '0' && c <= '9')
+	return isIdentStart(c) || (c >= '0' && c <= '9') || c == '-'
 }
 
 // Used in error messages from callers; kept here so the package stays

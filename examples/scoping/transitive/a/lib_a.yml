@@ -1,0 +1,9 @@
+# examples/scoping/transitive/a/lib_a.yml
+#
+# Level 1 include. Provides var_a and pulls in level 2.
+
+includes:
+  - "../b/lib_b.yml"
+
+vars:
+  var_a: "from-a"

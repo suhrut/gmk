@@ -18,12 +18,14 @@ func callFunc(t *testing.T, name string, args ...Value) (Value, error) {
 
 func TestFuncs_Registry(t *testing.T) {
 	r := DefaultFuncs()
-	// Stage 3a should ship exactly these 15 builtins.
+	// Stage 3a built-ins (15) + Stage 3b structured-value helpers (6) = 21.
 	want := []string{
 		"upper", "lower", "trim", "trim_left", "trim_right",
 		"to_string", "to_int", "len",
 		"starts_with", "ends_with", "contains", "replace",
 		"default", "coalesce", "join",
+		// Stage 3b:
+		"keys", "values", "first", "last", "to_json", "from_json",
 	}
 	for _, name := range want {
 		if _, ok := r.Get(name); !ok {
