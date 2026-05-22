@@ -18,6 +18,9 @@
 package materialize
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -29,6 +32,7 @@ import (
 	"github.com/suhrut/gmk/internal/expr"
 	"github.com/suhrut/gmk/internal/ir"
 	"github.com/suhrut/gmk/internal/logger"
+	"github.com/suhrut/gmk/internal/store"
 )
 
 // Callable is either a Target or a Function as far as the run-time
@@ -98,8 +102,16 @@ type CallableInvocation struct {
 	Name string
 	Kind string
 
-	// ScratchDir is the per-callable scratch directory inside the run's
-	// own dir. All JSON files live here, plus the script and log.jsonl.
+	// Day is "YYYYMMDD" for the run's bucket. Day + Seq together form
+	// the primary key in the runs table.
+	Day string
+
+	// Seq is the per-day monotonic allocation. Zero in the legacy path
+	// when no Store was supplied (tests only).
+	Seq int64
+
+	// ScratchDir is the per-callable scratch directory. JSON files
+	// live here plus the log.jsonl.
 	ScratchDir string
 
 	// ScriptPath is the script file the interpreter should execute.
@@ -127,58 +139,57 @@ type CallableInvocation struct {
 	Cwd string
 }
 
-// MaterializeOpts describes how to materialize. Mainly: where the
-// per-run scratch dir lives, and which language registry to consult.
-//
-// RunID is a string opaque to materialize — typically a timestamp +
-// random suffix. The caller (CLI) generates one per `gmk run` /
-// `gmk call` invocation and passes it through; nested calls under the
-// same parent process share the same RunID.
+// MaterializeOpts describes how to materialize. The store handles
+// per-invocation uniqueness; this struct carries the inputs we already
+// have at the call site (project root, args, prelude values, language
+// registry) and a Store pointer for the SQLite-backed allocation.
 type MaterializeOpts struct {
 	// ProjectRoot is the abs path to the project root (where .gmk-cache lives).
 	ProjectRoot string
 
-	// RunID identifies this run. The scratch dir is
-	// <ProjectRoot>/.gmk-cache/runs/<RunID>/<Name>/.
-	RunID string
+	// Store is the SQLite-backed run-id allocator. If nil, materialize
+	// falls back to time-based RunIDs (legacy path, kept for tests that
+	// don't want to set up a DB). New code should always pass a Store.
+	Store *store.Store
+
+	// Day is the YYYYMMDD bucket for the run. Empty => today's UTC date.
+	Day string
 
 	// Args are the caller-supplied arguments for this callable. Written
 	// to args.json. Always a non-nil map; pass empty if no args.
 	Args map[string]expr.Value
 
-	// Prelude is the already-evaluated prelude bindings (this layer does
-	// NOT evaluate the prelude — that's the runner/dispatcher's job, so
-	// expression evaluation can call back into the dispatcher and we
-	// don't get a dependency cycle here). May be nil for callables with
-	// no prelude.
+	// PreludeValues is the already-evaluated prelude bindings. This
+	// layer does NOT evaluate the prelude — the dispatcher does, so
+	// expression evaluation can recurse via ${call:...} without
+	// creating a layering cycle here.
 	PreludeValues map[string]expr.Value
 
 	// Languages is the project-level user-defined language registry.
 	// Built-ins are consulted first; this map overrides or adds.
 	Languages map[string]*ir.Language
-}
 
-// NewRunID returns a fresh run identifier. Format: YYYYMMDD-HHMMSS-<hex>.
-// Deterministic-prefix so chronological sort matches actual order.
-func NewRunID() string {
-	now := time.Now().UTC()
-	// We use UnixNano remainder as a per-run distinguisher; collisions
-	// at the second-resolution boundary are virtually impossible
-	// because parallel runs from the same process share a RunID anyway.
-	return fmt.Sprintf("%04d%02d%02d-%02d%02d%02d-%06x",
-		now.Year(), now.Month(), now.Day(),
-		now.Hour(), now.Minute(), now.Second(),
-		now.UnixNano()&0xffffff)
+	// SourceFile is the YAML file the callable came from, recorded in
+	// the runs table for provenance. Optional.
+	SourceFile string
 }
 
 // MaterializeCallable prepares everything needed to run a callable.
 // Returns a CallableInvocation that the runner can execute.
 //
-// The function does NOT evaluate the callable's prelude — that has
-// already been done by the caller, and the resulting map is passed in
-// via opts.PreludeValues. This separation matters because the prelude
-// may reference ${call:other(...)} which would re-enter the dispatcher;
-// if materialize did the eval itself we'd have a layering cycle.
+// Layout produced under .gmk-cache/:
+//
+//	bodies/<sha256>/body.<ext>          content-addressed; shared
+//	lib.sh                              project-wide bash helper
+//	runs/<YYYYMMDD>/<seq>-<callable>/
+//	    args.json
+//	    prelude.json
+//	    result.json                     seeded with "null"
+//	    log.jsonl
+//
+// Uniqueness of the runs/ subdir is guaranteed by store.AllocateRun,
+// which serializes via SQLite's writer lock — kernel-grade atomicity
+// without filesystem-level lock files.
 func MaterializeCallable(c *Callable, opts MaterializeOpts) (*CallableInvocation, error) {
 	if c == nil {
 		return nil, fmt.Errorf("materialize: callable is nil")
@@ -186,13 +197,36 @@ func MaterializeCallable(c *Callable, opts MaterializeOpts) (*CallableInvocation
 	if opts.ProjectRoot == "" {
 		return nil, fmt.Errorf("materialize %s: empty ProjectRoot", c.Name)
 	}
-	if opts.RunID == "" {
-		return nil, fmt.Errorf("materialize %s: empty RunID", c.Name)
+
+	day := opts.Day
+	if day == "" {
+		day = store.Today()
 	}
 
-	scratchDir := filepath.Join(opts.ProjectRoot, ".gmk-cache", "runs", opts.RunID, c.Name)
-	if err := os.MkdirAll(scratchDir, 0o755); err != nil {
-		return nil, fmt.Errorf("materialize %s: mkdir scratch: %w", c.Name, err)
+	// Allocate the per-day monotonic seq via SQLite, or fall back to a
+	// timestamp-based RunID when no store is provided (test helpers).
+	var (
+		seq    int64
+		runDir string
+	)
+	if opts.Store != nil {
+		s, err := opts.Store.AllocateRun(context.Background(), day)
+		if err != nil {
+			return nil, fmt.Errorf("materialize %s: allocate seq: %w", c.Name, err)
+		}
+		seq = s
+		runDir = filepath.Join(opts.ProjectRoot, ".gmk-cache", "runs", day,
+			fmt.Sprintf("%04d-%s", seq, c.Name))
+	} else {
+		// Legacy path: timestamp + nanosecond fallback. Kept so tests
+		// that materialize without a store keep working. Code paths
+		// that go through the CLI always pass a store.
+		runDir = filepath.Join(opts.ProjectRoot, ".gmk-cache", "runs", day,
+			fmt.Sprintf("%s-%s", NewRunID(), c.Name))
+	}
+
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		return nil, fmt.Errorf("materialize %s: mkdir %s: %w", c.Name, runDir, err)
 	}
 
 	lang := c.Lang
@@ -216,46 +250,52 @@ func MaterializeCallable(c *Callable, opts MaterializeOpts) (*CallableInvocation
 		interp = resolved
 	}
 
-	// Write args.json (always — even if empty, so the body can read it
-	// without checking existence).
-	argsPath := filepath.Join(scratchDir, "args.json")
+	// Args / prelude / result live in the per-call run dir.
+	argsPath := filepath.Join(runDir, "args.json")
 	if err := writeJSON(argsPath, valueMapToJSON(opts.Args)); err != nil {
 		return nil, fmt.Errorf("materialize %s: write args.json: %w", c.Name, err)
 	}
-
-	// Write prelude.json (always — body code looks for it via $GMK_PRELUDE).
-	preludePath := filepath.Join(scratchDir, "prelude.json")
+	preludePath := filepath.Join(runDir, "prelude.json")
 	if err := writeJSON(preludePath, valueMapToJSON(opts.PreludeValues)); err != nil {
 		return nil, fmt.Errorf("materialize %s: write prelude.json: %w", c.Name, err)
 	}
-
-	// result.json is created by the body — but seed it with null so
-	// callers that don't write get a deterministic "no result".
-	resultPath := filepath.Join(scratchDir, "result.json")
+	resultPath := filepath.Join(runDir, "result.json")
 	if err := writeJSONRaw(resultPath, []byte("null\n")); err != nil {
 		return nil, fmt.Errorf("materialize %s: seed result.json: %w", c.Name, err)
 	}
 
-	// Write the body script. We add a small preamble per language so
-	// scripts get sensible defaults (strict mode for bash, etc.).
-	scriptPath := filepath.Join(scratchDir, "body"+langDef.Ext)
-
-	// For bash/sh, drop lib.sh alongside the script so the body can
-	// source it for ergonomic JSON access (p_get / a_get / r_set / ...).
+	// lib.sh: project-wide single copy at .gmk-cache/lib.sh. Two
+	// concurrent calls writing it race benignly — bytes are identical
+	// and atomicWrite uses temp+rename.
 	libPath := ""
 	if langDef.Name == "bash" || langDef.Name == "sh" {
-		libPath = filepath.Join(scratchDir, "lib.sh")
-		if err := atomicWrite(libPath, []byte(libShContents), 0o644); err != nil {
-			return nil, fmt.Errorf("materialize %s: write lib.sh: %w", c.Name, err)
+		libPath = filepath.Join(opts.ProjectRoot, ".gmk-cache", "lib.sh")
+		if _, err := os.Stat(libPath); os.IsNotExist(err) {
+			if err := atomicWrite(libPath, []byte(libShContents), 0o644); err != nil {
+				return nil, fmt.Errorf("materialize %s: write lib.sh: %w", c.Name, err)
+			}
 		}
 	}
 
+	// Body: content-addressed at .gmk-cache/bodies/<sha256>/body.<ext>.
+	// Hash inputs: language name, file extension, libPath (so changing
+	// lib.sh path invalidates), and the user's body text. Two callables
+	// with byte-identical bodies under the same language share the
+	// generated file.
 	content := renderBody(langDef, c.Run, libPath)
-	if err := atomicWrite(scriptPath, []byte(content), 0o755); err != nil {
-		return nil, fmt.Errorf("materialize %s: write script: %w", c.Name, err)
+	bodyHash := sha256OfStrings(langDef.Name, langDef.Ext, libPath, content)
+	bodyDir := filepath.Join(opts.ProjectRoot, ".gmk-cache", "bodies", bodyHash)
+	scriptPath := filepath.Join(bodyDir, "body"+langDef.Ext)
+	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
+		if err := os.MkdirAll(bodyDir, 0o755); err != nil {
+			return nil, fmt.Errorf("materialize %s: mkdir bodies: %w", c.Name, err)
+		}
+		if err := atomicWrite(scriptPath, []byte(content), 0o755); err != nil {
+			return nil, fmt.Errorf("materialize %s: write body: %w", c.Name, err)
+		}
 	}
 
-	logPath := filepath.Join(scratchDir, "log.jsonl")
+	logPath := filepath.Join(runDir, "log.jsonl")
 
 	// Resolve Cwd to abs.
 	cwd := c.Cwd
@@ -269,25 +309,39 @@ func MaterializeCallable(c *Callable, opts MaterializeOpts) (*CallableInvocation
 	argv := append([]string{interp}, langDef.Args...)
 	argv = append(argv, scriptPath)
 
+	// GMK_RUN_ID is "<day>/<seq>" — a stable token any caller can use
+	// as a SQL key into the runs table or as a path reference.
+	runID := day
+	if seq > 0 {
+		runID = fmt.Sprintf("%s/%04d", day, seq)
+	}
+
 	env := map[string]string{
 		"GMK_ARGS":    argsPath,
 		"GMK_PRELUDE": preludePath,
 		"GMK_RESULT":  resultPath,
 		"GMK_NAME":    c.Name,
 		"GMK_KIND":    c.Kind,
-		"GMK_RUN_ID":  opts.RunID,
+		"GMK_RUN_ID":  runID,
+		"GMK_DAY":     day,
+	}
+	if seq > 0 {
+		env["GMK_SEQ"] = fmt.Sprintf("%d", seq)
 	}
 	for k, v := range c.Env {
 		env[k] = v
 	}
 
 	logger.Get("gmk.materialize").Debug("callable materialized",
-		"callable", c.Name, "lang", lang, "scratch", scratchDir)
+		"callable", c.Name, "lang", lang,
+		"day", day, "seq", seq, "scratch", runDir, "body_hash", bodyHash)
 
 	return &CallableInvocation{
 		Name:        c.Name,
 		Kind:        c.Kind,
-		ScratchDir:  scratchDir,
+		Day:         day,
+		Seq:         seq,
+		ScratchDir:  runDir,
 		ScriptPath:  scriptPath,
 		ArgsPath:    argsPath,
 		PreludePath: preludePath,
@@ -416,6 +470,33 @@ func writeJSONRaw(path string, data []byte) error {
 	return atomicWrite(path, data, 0o644)
 }
 
+// sha256OfStrings produces a hex sha256 of the concatenation of inputs,
+// each separated by a NUL byte so e.g. ("a","bc") and ("ab","c") hash
+// differently. Used to content-address generated body files.
+func sha256OfStrings(parts ...string) string {
+	h := sha256.New()
+	for i, p := range parts {
+		if i > 0 {
+			h.Write([]byte{0})
+		}
+		h.Write([]byte(p))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// NewRunID is the legacy time-based identifier used as a fallback when
+// MaterializeCallable is called without a Store. Stage 3a/3b code went
+// through this path; new code goes through store.AllocateRun and ignores
+// this function. Kept exported so existing tests that pre-date the
+// store integration still compile.
+func NewRunID() string {
+	now := time.Now().UTC()
+	return fmt.Sprintf("%04d%02d%02d-%02d%02d%02d-%06x",
+		now.Year(), now.Month(), now.Day(),
+		now.Hour(), now.Minute(), now.Second(),
+		now.UnixNano()&0xffffff)
+}
+
 // ReadResultFile parses result.json and returns the resulting Value.
 // Called by the runner after the body completes to extract the
 // function's return value.
@@ -441,3 +522,8 @@ func ReadResultFile(path string) (expr.Value, error) {
 	}
 	return expr.FromJSON(raw)
 }
+
+// Today returns today's date in "YYYYMMDD" UTC format. Convenience shim
+// around store.Today() so callers don't need to import the store
+// package just to construct a MaterializeOpts.Day.
+func Today() string { return store.Today() }

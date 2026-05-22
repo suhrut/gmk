@@ -5,6 +5,14 @@
 # and `go build ./cmd/gmk` do the same thing. It's here so devs can type
 # `make examples` instead of remembering the integration package path.
 #
+# Build dependency: gmk uses SQLite (via mattn/go-sqlite3) for run-id
+# allocation and call metadata. This requires CGO_ENABLED=1 at build
+# time, plus the libsqlite3 development headers:
+#
+#   Debian/Ubuntu:  apt install libsqlite3-dev
+#   macOS:          ships with the Xcode CLI tools
+#   Alpine:         apk add sqlite-dev
+#
 # Self-hosting note: once Stage 5 lands file targets (with declared
 # outputs), this Makefile becomes deletable — gmk will be able to drive
 # its own examples via a top-level build.yml. Stage 5 is the right point
@@ -12,6 +20,10 @@
 # express "run all examples and cache the result".
 
 .PHONY: all build test examples vet fmt clean help
+
+# Ensure CGO is on for every recipe in this file. Users who set
+# CGO_ENABLED=0 globally otherwise get a confusing link error.
+export CGO_ENABLED=1
 
 # Default goal — quick smoke check.
 all: vet test

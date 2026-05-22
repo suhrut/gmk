@@ -4,6 +4,7 @@ go 1.25
 
 require (
 	github.com/goccy/go-yaml v1.18.0
+	github.com/mattn/go-sqlite3 v1.14.22
 	github.com/spf13/cobra v1.10.1
 )
 

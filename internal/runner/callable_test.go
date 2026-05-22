@@ -43,7 +43,7 @@ printf '%s' '"hello, '"$name"'"' > "$GMK_RESULT"
 	c := &materialize.Callable{Name: "greet", Kind: "function", Run: body, Lang: "bash"}
 	inv, err := materialize.MaterializeCallable(c, materialize.MaterializeOpts{
 		ProjectRoot: root,
-		RunID:       "r1",
+		Day: "20260522",
 		Args:        map[string]expr.Value{"name": expr.NewString("Sam")},
 	})
 	if err != nil {
@@ -83,7 +83,7 @@ jq -n --arg h "$host" --argjson p "$port" '{host: $h, port: $p, ready: true}' > 
 	c := &materialize.Callable{Name: "show-config", Kind: "function", Run: body, Lang: "bash"}
 	inv, err := materialize.MaterializeCallable(c, materialize.MaterializeOpts{
 		ProjectRoot: root,
-		RunID:       "r1",
+		Day: "20260522",
 		PreludeValues: map[string]expr.Value{
 			"host": expr.NewString("db.local"),
 			"port": expr.NewInt(5432),
@@ -124,7 +124,7 @@ func TestRunCallable_NonZeroExit(t *testing.T) {
 	c := &materialize.Callable{Name: "fail", Kind: "function", Run: body, Lang: "bash"}
 	inv, err := materialize.MaterializeCallable(c, materialize.MaterializeOpts{
 		ProjectRoot: root,
-		RunID:       "r1",
+		Day: "20260522",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -152,7 +152,7 @@ func TestRunCallable_StdoutCaptured(t *testing.T) {
 	root := t.TempDir()
 	c := &materialize.Callable{Name: "out", Kind: "function", Run: body, Lang: "bash"}
 	inv, _ := materialize.MaterializeCallable(c, materialize.MaterializeOpts{
-		ProjectRoot: root, RunID: "r",
+		ProjectRoot: root, Day: "20260522",
 	})
 
 	var stdout, stderr bytes.Buffer
@@ -182,7 +182,7 @@ test -f "$GMK_PRELUDE" || { echo "no prelude file"; exit 1; }
 	root := t.TempDir()
 	c := &materialize.Callable{Name: "envcheck", Kind: "function", Run: body, Lang: "bash"}
 	inv, _ := materialize.MaterializeCallable(c, materialize.MaterializeOpts{
-		ProjectRoot: root, RunID: "RID-123",
+		ProjectRoot: root, Day: "20260522",
 	})
 
 	var stdout bytes.Buffer
@@ -202,7 +202,7 @@ test -f "$GMK_PRELUDE" || { echo "no prelude file"; exit 1; }
 	if !strings.Contains(out, "kind=function") {
 		t.Errorf("GMK_KIND missing: %q", out)
 	}
-	if !strings.Contains(out, "run=RID-123") {
-		t.Errorf("GMK_RUN_ID missing: %q", out)
+	if !strings.Contains(out, "run=20260522") {
+		t.Errorf("GMK_RUN_ID missing or wrong (expected day prefix): %q", out)
 	}
 }

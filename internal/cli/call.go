@@ -21,12 +21,14 @@ package cli
 //   --pretty: print indented JSON
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -37,6 +39,7 @@ import (
 	"github.com/suhrut/gmk/internal/materialize"
 	"github.com/suhrut/gmk/internal/resolve"
 	"github.com/suhrut/gmk/internal/runner"
+	"github.com/suhrut/gmk/internal/store"
 )
 
 func newCallCmd() *cobra.Command {
@@ -256,8 +259,23 @@ func coerceArg(raw string) expr.Value {
 // runner to execute the callable once. The bodyOut writer is where the
 // body's stdout/stderr go (typically os.Stderr so it doesn't mix with
 // the gmk-call result printed to stdout).
+//
+// Each call (top-level and nested via ${call:...}) gets:
+//   - a unique seq allocated via the SQLite store
+//   - a 'running' row inserted at start
+//   - a final UPDATE with status + duration + result at finish
+//
+// The store is opened once for the whole top-level invocation and
+// passed to materialize/runner via the closure.
 func runCallOnce(p *ir.Project, fn *ir.Function, tgt *ir.Target, args map[string]expr.Value, bodyOut io.Writer) (*runner.CallableResult, error) {
-	runID := materialize.NewRunID()
+	ctx := context.Background()
+	day := materialize.Today()
+
+	st, err := store.Open(p.Root)
+	if err != nil {
+		return nil, fmt.Errorf("open store: %w", err)
+	}
+	defer st.Close()
 
 	// Build a Runner closure that the dispatcher calls when expression
 	// evaluation hits a ${call:...}. This is the same path the top-level
@@ -280,18 +298,61 @@ func runCallOnce(p *ir.Project, fn *ir.Function, tgt *ir.Target, args map[string
 		c := materialize.CallableFromFunction(targetFn)
 		inv, merr := materialize.MaterializeCallable(c, materialize.MaterializeOpts{
 			ProjectRoot:   p.Root,
-			RunID:         runID,
+			Store:         st,
+			Day:           day,
 			Args:          boundArgs,
 			PreludeValues: preludeValues,
 			Languages:     p.Languages,
+			SourceFile:    targetFn.Source.File,
 		})
 		if merr != nil {
 			return expr.NewNone(), merr
+		}
+		// Record start now that we have a seq.
+		startTime := time.Now().UTC()
+		argsJSON := jsonOrEmpty(boundArgs)
+		preludeJSON := jsonOrEmpty(preludeValues)
+		if err := st.RecordStart(ctx, store.StartParams{
+			Day:          day,
+			Seq:          inv.Seq,
+			CallableName: targetFn.Name,
+			CallableKind: "function",
+			StartedAt:    startTime,
+			ArgsJSON:     argsJSON,
+			PreludeJSON:  preludeJSON,
+			SourceFile:   targetFn.Source.File,
+		}); err != nil {
+			return expr.NewNone(), fmt.Errorf("store: record start: %w", err)
 		}
 		res, rerr := runner.RunCallable(inv, runner.RunCallableOpts{
 			Stdout:     bodyOut,
 			Stderr:     bodyOut,
 			InheritEnv: true,
+		})
+		// Finalize the row regardless of how it ended.
+		finishStatus := "ok"
+		if rerr != nil {
+			finishStatus = "error"
+		} else if res.ExitCode != 0 {
+			finishStatus = "fail"
+		}
+		var resultJSON string
+		var exitCode int
+		if res != nil {
+			exitCode = res.ExitCode
+			if res.Value.Kind != expr.NoneKind {
+				if b, err := jsonMarshalValue(res.Value); err == nil {
+					resultJSON = b
+				}
+			}
+		}
+		_ = st.FinishRun(ctx, store.FinishParams{
+			Day:        day,
+			Seq:        inv.Seq,
+			FinishedAt: time.Now().UTC(),
+			Status:     finishStatus,
+			ExitCode:   exitCode,
+			ResultJSON: resultJSON,
 		})
 		if rerr != nil {
 			return expr.NewNone(), rerr
@@ -322,19 +383,86 @@ func runCallOnce(p *ir.Project, fn *ir.Function, tgt *ir.Target, args map[string
 	c := materialize.CallableFromTarget(tgt)
 	inv, err := materialize.MaterializeCallable(c, materialize.MaterializeOpts{
 		ProjectRoot:   p.Root,
-		RunID:         runID,
+		Store:         st,
+		Day:           day,
 		Args:          args,
 		PreludeValues: preludeValues,
 		Languages:     p.Languages,
+		SourceFile:    tgt.Source.File,
 	})
 	if err != nil {
 		return nil, err
 	}
-	return runner.RunCallable(inv, runner.RunCallableOpts{
+	startTime := time.Now().UTC()
+	if err := st.RecordStart(ctx, store.StartParams{
+		Day:          day,
+		Seq:          inv.Seq,
+		CallableName: tgt.Name,
+		CallableKind: "target",
+		StartedAt:    startTime,
+		ArgsJSON:     jsonOrEmpty(args),
+		PreludeJSON:  jsonOrEmpty(preludeValues),
+		SourceFile:   tgt.Source.File,
+	}); err != nil {
+		return nil, err
+	}
+	res, rerr := runner.RunCallable(inv, runner.RunCallableOpts{
 		Stdout:     bodyOut,
 		Stderr:     bodyOut,
 		InheritEnv: true,
 	})
+	finishStatus := "ok"
+	if rerr != nil {
+		finishStatus = "error"
+	} else if res != nil && res.ExitCode != 0 {
+		finishStatus = "fail"
+	}
+	var resultJSON string
+	if res != nil && res.Value.Kind != expr.NoneKind {
+		if b, jerr := jsonMarshalValue(res.Value); jerr == nil {
+			resultJSON = b
+		}
+	}
+	exitCode := 0
+	if res != nil {
+		exitCode = res.ExitCode
+	}
+	_ = st.FinishRun(ctx, store.FinishParams{
+		Day:        day,
+		Seq:        inv.Seq,
+		FinishedAt: time.Now().UTC(),
+		Status:     finishStatus,
+		ExitCode:   exitCode,
+		ResultJSON: resultJSON,
+	})
+	return res, rerr
+}
+
+// jsonOrEmpty marshals a Value map to JSON. Returns "" on error or
+// empty map so the column ends up as SQL NULL.
+func jsonOrEmpty(m map[string]expr.Value) string {
+	if len(m) == 0 {
+		return ""
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = v.ToJSON()
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// jsonMarshalValue serializes a single Value to JSON for the
+// result_json column.
+func jsonMarshalValue(v expr.Value) (string, error) {
+	b, err := json.Marshal(v.ToJSON())
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
 
 // evaluatePrelude evaluates each prelude entry in declaration order

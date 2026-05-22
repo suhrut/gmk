@@ -229,14 +229,110 @@ internal/integration                28   (+9 new TestExamplesCall subtests)
 internal/ir                          6
 internal/load                       55   (+15 new in 3b)
 internal/logger                     18   (NEW)
-internal/materialize                15   (+9 new callable tests)
+internal/materialize                19   (+13 new: 9 callable + 6 store-integration)
 internal/resolve                    18
 internal/runner                     17   (+5 new callable tests)
 internal/scope                      36
+internal/store                      14   (NEW)
                                   -----
-Total                              335 explicit tests + ~19 subtests
-                                   = 354 passing, 1 skipped (jq required)
+Total                              353 explicit tests + ~21 subtests
+                                   = 374 passing, 1 skipped (jq required)
 ```
+
+## SQLite-backed run-id allocation (Stage 3b post-fix)
+
+The first version of Stage 3b used a time-based `NewRunID()`
+(`YYYYMMDD-HHMMSS-<24 bits of UnixNano>`). The hex suffix masked to
+16,777,216 values; in a CI matrix running parallel `gmk call` from the
+same project dir, the same RunID could be returned to two processes,
+causing their scratch dirs to overlap and the JSON files to race.
+
+The fix is a SQLite-backed allocator. One SQLite database lives at
+`.gmk-cache/gmk.db` per project. Run IDs are allocated with a single
+atomic statement:
+
+```sql
+INSERT INTO day_counters (day, next_seq) VALUES (?, 2)
+  ON CONFLICT(day) DO UPDATE SET next_seq = day_counters.next_seq + 1
+  RETURNING next_seq - 1;
+```
+
+SQLite serializes concurrent writers via its writer lock — kernel-grade
+atomicity, portable across every filesystem we deploy on (ext4, xfs,
+APFS, NTFS, tmpfs, Docker bind mounts, WSL2). The 16-goroutine ×
+25-allocation stress test (`TestStore_AllocateRun_ConcurrentNoDup`)
+produces exactly 400 unique sequential IDs across both unit-level and
+materialize-integration layers.
+
+### Schema
+
+Two tables in the initial migration (`internal/store/migrations/0001_initial.sql`):
+
+- **day_counters**: `(day TEXT PK, next_seq INTEGER)` — per-day monotonic counter.
+- **runs**: `(day, seq, callable_name, callable_kind, started_at, finished_at,
+  duration_ms, status, exit_code, args_json, prelude_json, result_json,
+  source_file, gmk_pid)` keyed by `(day, seq)`. Indexes: by callable name,
+  partial index on `status = 'running'` for "what's stuck right now"
+  queries, and by `started_at` for chronological listings.
+
+Migration version is tracked in SQLite's `PRAGMA user_version`; future
+tables (Stage 5 cache, Stage 6 var-evaluations, Stage 8 file-inputs) are
+added as new numbered .sql files under `migrations/` and embedded with
+`//go:embed`.
+
+### New file layout
+
+```
+.gmk-cache/
+  gmk.db                              SQLite + WAL sidecars
+  lib.sh                              project-wide single copy
+  bodies/<sha256>/body.<ext>          content-addressed; shared across calls
+  runs/<YYYYMMDD>/<seq>-<callable>/
+    args.json
+    prelude.json
+    result.json
+    log.jsonl
+```
+
+The dir name `<seq>-<callable>` (4-digit zero-padded seq) makes
+chronological listings human-readable and matches the DB row exactly.
+`sqlite3 .gmk-cache/gmk.db "SELECT seq, callable_name, status, duration_ms FROM runs WHERE day='20260522'"` shows the whole day's activity.
+
+### Free wins from this refactor
+
+- **Content-addressed bodies.** Two callables with byte-identical bodies
+  hash to the same path in `.gmk-cache/bodies/<sha256>/`. Concurrent
+  writers of identical content race benignly because `atomicWrite` uses
+  temp+rename — the bytes always end up correct.
+- **Single project-wide lib.sh.** Was previously written per-scratch-dir
+  (one copy per call). Now lives at `.gmk-cache/lib.sh` and every body
+  sources the same path.
+- **Provenance.** Every call's args, prelude, result, status, duration,
+  exit code, and source file are persisted. Stage 7's `gmk inspect
+  <day>/<seq>` will read directly from this table.
+- **Foundation for later stages.** Stage 5 cache, Stage 6 lazy vars,
+  Stage 8 file-input tracking — all small additions to the same .db.
+
+### New env vars exposed to bodies
+
+In addition to the Stage 3b base (`GMK_ARGS`, `GMK_PRELUDE`, `GMK_RESULT`,
+`GMK_NAME`, `GMK_KIND`, `GMK_RUN_ID`), the store path adds:
+
+- `GMK_DAY` — `YYYYMMDD` for the run.
+- `GMK_SEQ` — per-day monotonic sequence number.
+- `GMK_RUN_ID` is now `<day>/<seq>` (was opaque token) — usable as a
+  natural key into the runs table from inside scripts.
+
+### Dependency
+
+This adds `github.com/mattn/go-sqlite3 v1.14.22` as a single new direct
+dependency. It needs `CGO_ENABLED=1` and the libsqlite3 headers at build
+time (`apt install libsqlite3-dev` on Debian/Ubuntu; comes pre-installed
+on macOS via the Xcode CLI tools). Build instructions in the Makefile
+were updated accordingly. The CGO requirement is the only practical
+downside; the alternative pure-Go `modernc.org/sqlite` is blocked by
+this sandbox's network policy but is the preferred long-term choice if
+we want to drop cgo — drop-in API compatible.
 
 ## CLI surface
 
@@ -318,13 +414,19 @@ cd ../prelude
 - [x] `gmk doc <name>` CLI (with --json and --shell-helpers)
 - [x] `gmk schema` CLI (JSON Schema for editor LSPs)
 - [x] Shell completion (cobra built-in: bash/zsh/fish/powershell)
+- [x] SQLite-backed run-id allocation (replaces racy time-based RunID)
+- [x] Content-addressed body sharing under `.gmk-cache/bodies/<sha256>/`
+- [x] Project-wide single `lib.sh` (was per-call)
+- [x] Per-call run persistence (args/prelude/result/status/duration in DB)
 - [x] Examples for functions, prelude, multi-language
 - [x] Integration tests exercising the whole stack
+- [x] Concurrency stress test (16 goroutines × 25 allocs, zero duplicates)
+- [ ] `gmk inspect <day>/<seq>` for run-row introspection
 - [ ] `gmk graph`, parent-socket IPC for child `gmk call`
 - [ ] gmk-sh (deferred to Stage 4a)
 - [ ] Plugin-protocol stub→real (Stage 3f)
 - [ ] Templates (Stage 3c), YAML tags (Stage 3d), secrets (Stage 3e)
 
-Stage 3b is functionally complete for its core architectural goals AND
-the Tier-1 UX commands; the remaining checkboxes are convenience
-features that don't change the shape of anything.
+Stage 3b is functionally complete for its core architectural goals,
+the Tier-1 UX commands, AND the persistent-state layer that all future
+stages depend on. The remaining checkboxes are convenience features.

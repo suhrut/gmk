@@ -93,7 +93,7 @@ func defaultArgsFor(fn *ir.Function) map[string]expr.Value {
 // build the dispatcher, evaluate prelude, materialize, run.
 func callFunctionUnderTest(t *testing.T, p *ir.Project, fn *ir.Function, args map[string]expr.Value) error {
 	t.Helper()
-	runID := materialize.NewRunID()
+	day := materialize.Today()
 
 	var dispatch *funcs.Dispatcher
 	doRun := func(targetFn *ir.Function, boundArgs map[string]expr.Value) (expr.Value, error) {
@@ -107,7 +107,7 @@ func callFunctionUnderTest(t *testing.T, p *ir.Project, fn *ir.Function, args ma
 		c := materialize.CallableFromFunction(targetFn)
 		inv, merr := materialize.MaterializeCallable(c, materialize.MaterializeOpts{
 			ProjectRoot:   p.Root,
-			RunID:         runID,
+			Day:           day,
 			Args:          boundArgs,
 			PreludeValues: preludeValues,
 			Languages:     p.Languages,

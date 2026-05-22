@@ -22,7 +22,7 @@ func TestCallable_BasicBash(t *testing.T) {
 	}
 	inv, err := materialize.MaterializeCallable(c, materialize.MaterializeOpts{
 		ProjectRoot: root,
-		RunID:       "test-run",
+		Day:         "20260522",
 		Args: map[string]expr.Value{
 			"greeting": expr.NewString("hello"),
 		},
@@ -38,9 +38,9 @@ func TestCallable_BasicBash(t *testing.T) {
 	if _, err := os.Stat(inv.ScratchDir); err != nil {
 		t.Errorf("scratch dir not created: %v", err)
 	}
-	wantDir := filepath.Join(root, ".gmk-cache", "runs", "test-run", "hello")
-	if inv.ScratchDir != wantDir {
-		t.Errorf("scratch=%q, want %q", inv.ScratchDir, wantDir)
+	wantPrefix := filepath.Join(root, ".gmk-cache", "runs", "20260522")
+	if !strings.HasPrefix(inv.ScratchDir, wantPrefix) || !strings.HasSuffix(inv.ScratchDir, "-hello") {
+		t.Errorf("scratch=%q should start with %q and end with -hello", inv.ScratchDir, wantPrefix)
 	}
 
 	// args.json — contents check.
@@ -126,7 +126,7 @@ func TestCallable_LanguagePython(t *testing.T) {
 	}
 	inv, err := materialize.MaterializeCallable(c, materialize.MaterializeOpts{
 		ProjectRoot: root,
-		RunID:       "r1",
+		Day:         "20260522",
 	})
 	if err != nil {
 		// Python may not be installed in test env; skip rather than fail.
@@ -150,7 +150,7 @@ func TestCallable_EmptyArgs(t *testing.T) {
 	c := &materialize.Callable{Name: "f", Kind: "function", Run: "true", Lang: "bash"}
 	inv, err := materialize.MaterializeCallable(c, materialize.MaterializeOpts{
 		ProjectRoot: root,
-		RunID:       "r",
+		Day:         "20260522",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -166,7 +166,7 @@ func TestCallable_UnknownLanguage(t *testing.T) {
 	c := &materialize.Callable{Name: "f", Kind: "function", Run: "x", Lang: "haskell"}
 	_, err := materialize.MaterializeCallable(c, materialize.MaterializeOpts{
 		ProjectRoot: t.TempDir(),
-		RunID:       "r",
+		Day:         "20260522",
 	})
 	if err == nil || !strings.Contains(err.Error(), "unknown language") {
 		t.Errorf("expected unknown-language error, got %v", err)
@@ -178,7 +178,7 @@ func TestCallable_UserDefinedLanguage(t *testing.T) {
 	c := &materialize.Callable{Name: "f", Kind: "function", Run: "echo", Lang: "myzsh"}
 	inv, err := materialize.MaterializeCallable(c, materialize.MaterializeOpts{
 		ProjectRoot: root,
-		RunID:       "r",
+		Day:         "20260522",
 		Languages: map[string]*ir.Language{
 			"myzsh": {Name: "myzsh", Interpreter: "bash", Ext: ".zsh"},
 		},
