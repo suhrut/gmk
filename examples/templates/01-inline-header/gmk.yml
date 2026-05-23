@@ -1,0 +1,36 @@
+# Stage 3c example #1: a tiny inline-body template producing a
+# license header. The simplest possible template — one inline body,
+# one render call, output piped to a file.
+#
+# What this teaches:
+#   - Inline `body:` form (no separate file needed for short stuff)
+#   - Default engine (jinja, set in cmd/gmk/main.go); explicit
+#     `engine:` omitted here
+#   - Named args to render
+#   - Rendered string flowing through a target body to a real file
+#
+# Try it:
+#   gmk run emit-header
+#   cat /tmp/header.txt
+#
+# Note: under `-tags nogonja` builds (no jinja engine), this example
+# is skipped by TestExamplesRun. To run without jinja, add
+# `engine: go` to the template and convert `{{ year }}` etc to
+# `{{ .year }}` for Go text/template syntax.
+
+templates:
+  license-header:
+    body: |
+      // Copyright {{ year }} {{ owner }}
+      // SPDX-License-Identifier: {{ spdx }}
+      //
+      // This file is part of {{ project }}.
+
+targets:
+  emit-header:
+    run: |
+      cat > /tmp/header.txt <<'HEADER'
+      ${render:license-header(year="2026", owner="GssMahadevan", spdx="Apache-2.0", project="gmk")}
+      HEADER
+      echo "Wrote /tmp/header.txt:"
+      cat /tmp/header.txt

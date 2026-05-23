@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ name }}
+  labels:
+    {% for k, v in labels.items() %}{{ k }}: {{ v }}
+    {% endfor %}
+spec:
+  replicas: {{ replicas }}
+  selector:
+    matchLabels:
+      app: {{ name }}
+  template:
+    metadata:
+      labels:
+        app: {{ name }}
+        {% for k, v in labels.items() %}{{ k }}: {{ v }}
+        {% endfor %}
+    spec:
+      containers:
+      - name: {{ name }}
+        image: {{ image }}:{{ tag }}
+        ports:
+        - containerPort: {{ container_port }}
+        {% if env %}env:
+        {% for k, v in env.items() %}- name: {{ k }}
+          value: "{{ v }}"
+        {% endfor %}{% endif %}
+        {% if resources %}resources:
+          requests:
+            cpu: "{{ resources.cpu }}"
+            memory: "{{ resources.memory }}"
+        {% endif %}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ name }}
+spec:
+  selector:
+    app: {{ name }}
+  ports:
+  - port: {{ service_port }}
+    targetPort: {{ container_port }}

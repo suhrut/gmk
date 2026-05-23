@@ -333,20 +333,33 @@ type NamedCall struct {
 	Args []NamedArg
 }
 
-// NamedArg is one (name, value) pair in a NamedCall argument list.
-// A bare positional arg has Name == "".
+// NamedArg is one entry in a NamedCall argument list. Three shapes:
+//
+//   - Bare positional:  Name == "",   IsSplat == false  -> args["0"], args["1"], ...
+//   - Named:            Name != "",   IsSplat == false  -> args[Name]
+//   - Splat:            Name == "",   IsSplat == true   -> Value must be a Map;
+//                       evaluation spreads each (k, v) into the args map.
+//
+// Splat lets callers pass a pre-assembled Map of args, common in
+// template rendering where the data shape is built once (perhaps by
+// loading JSON or composing several upstream calls) and then handed
+// to a template wholesale. Syntax: `${render:tmpl(...mapvar)}`.
 type NamedArg struct {
-	Name  string
-	Value Node
+	Name    string
+	Value   Node
+	IsSplat bool
 }
 
 func (n *NamedCall) Pos() Position { return n.P }
 func (n *NamedCall) String() string {
 	parts := make([]string, len(n.Args))
 	for i, a := range n.Args {
-		if a.Name != "" {
+		switch {
+		case a.IsSplat:
+			parts[i] = "..." + a.Value.String()
+		case a.Name != "":
 			parts[i] = a.Name + "=" + a.Value.String()
-		} else {
+		default:
 			parts[i] = a.Value.String()
 		}
 	}

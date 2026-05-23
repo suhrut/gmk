@@ -33,6 +33,7 @@ const (
 	tokModAlt  // :+   (alternate modifier)
 	tokTrue    // true
 	tokFalse   // false
+	tokSplat   // ...   (Stage 3c.1.1: splat in named-call args, e.g. fn(...mapvar))
 )
 
 func (t TokenType) String() string {
@@ -79,6 +80,8 @@ func (t TokenType) String() string {
 		return "true"
 	case tokFalse:
 		return "false"
+	case tokSplat:
+		return "..."
 	default:
 		return "?"
 	}
@@ -208,6 +211,12 @@ func (l *Lexer) advance() (Token, error) {
 		l.pos++
 		return Token{Type: tokComma, Value: ",", Pos: startPos}, nil
 	case c == '.':
+		// Three-dot splat (...mapvar in named-call args) vs single dot
+		// (field access like obj.field). The longer match wins.
+		if l.pos+2 < len(l.src) && l.src[l.pos+1] == '.' && l.src[l.pos+2] == '.' {
+			l.pos += 3
+			return Token{Type: tokSplat, Value: "...", Pos: startPos}, nil
+		}
 		l.pos++
 		return Token{Type: tokDot, Value: ".", Pos: startPos}, nil
 	case c == '|':

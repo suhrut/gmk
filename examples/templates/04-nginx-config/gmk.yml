@@ -1,0 +1,72 @@
+# Stage 3c example #4: an nginx config rendered from declarative
+# site/upstream data built in a function body via Python.
+#
+# What this teaches:
+#   - Lists of maps as nested function results — Python builds
+#     the structure, dumps JSON to $GMK_RESULT, gmk parses it
+#   - Different language for the data source (python here, bash in
+#     example #3) showing the IPC is engine-agnostic
+#   - Jinja filters: `| default(N)` for optional values
+#   - Lists of maps (sites, locations) and iterating them
+#   - {% elif %} for branched conditionals
+#
+# Try it:
+#   gmk run emit-nginx
+#   cat /tmp/nginx.conf
+
+functions:
+  nginx-data:
+    result: {type: map}
+    lang: python
+    run: |
+      import json
+      import os
+      data = {
+        "upstreams": {
+          "api_backend": [
+            "10.0.1.10:8080",
+            "10.0.1.11:8080",
+            "10.0.1.12:8080",
+          ]
+        },
+        "sites": [
+          {
+            "hostname": "api.example.com",
+            "port": 80,
+            "tls": True,
+            "locations": [
+              {"path": "/", "proxy_pass": "http://api_backend"},
+              {"path": "/health", "proxy_pass": "http://api_backend/healthz"},
+            ],
+          },
+          {
+            "hostname": "static.example.com",
+            "tls": False,    # port omitted → jinja `| default(80)` kicks in
+            "locations": [
+              {"path": "/", "root": "/var/www/static"},
+            ],
+          },
+        ],
+      }
+      with open(os.environ["GMK_RESULT"], "w") as f:
+        json.dump(data, f)
+
+templates:
+  nginx-conf:
+    engine: jinja
+    file: templates/nginx.jinja
+    doc: |
+      Renders an nginx.conf from a declarative sites + upstreams
+      shape. Optional fields (worker_processes, port, tls) use
+      Jinja's `| default(...)` filter.
+
+targets:
+  emit-nginx:
+    prelude:
+      data: "${call:nginx-data()}"
+    run: |
+      cat > /tmp/nginx.conf << 'CONF'
+      ${render:nginx-conf(...data)}
+      CONF
+      echo "Wrote /tmp/nginx.conf:"
+      cat /tmp/nginx.conf

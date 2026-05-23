@@ -122,6 +122,43 @@ func ResolveStringInScopeWithRender(s string, sc *ir.Scope, renders expr.RenderR
 	return e.EvalToString(node)
 }
 
+// ResolveStringWithVarsAndRender resolves a template string with an
+// explicit VarResolver layered on top of (or replacing) a Scope. The
+// canonical Stage 3c use is body interpolation for a target whose
+// prelude bound some names: the caller passes a preludeScope resolver
+// that checks bound prelude values first, then falls through to the
+// project scope.
+//
+// Semantics:
+//   - extraVars != nil → all lookups go through extraVars first. If
+//     extraVars doesn't have a name, it's expected to fall through
+//     to the project scope itself (the caller's responsibility — we
+//     don't auto-chain because the chain order is caller-specific).
+//   - extraVars == nil → equivalent to ResolveStringInScopeWithRender
+//     against sc.
+//
+// This is the most general form; the other two ResolveString* variants
+// are kept as convenience wrappers because they cover the common cases
+// and changing their signatures would churn many callers.
+func ResolveStringWithVarsAndRender(s string, sc *ir.Scope, extraVars expr.VarResolver, renders expr.RenderResolver) (string, error) {
+	if sc == nil && extraVars == nil {
+		return "", fmt.Errorf("ResolveStringWithVarsAndRender: both scope and extraVars are nil")
+	}
+	node, err := expr.ParseTemplate(s, expr.Position{})
+	if err != nil {
+		return "", err
+	}
+	var resolver expr.VarResolver
+	if extraVars != nil {
+		resolver = extraVars
+	} else {
+		resolver = newScopeResolver(sc)
+	}
+	e := newEvaluator(resolver)
+	e.Renders = renders
+	return e.EvalToString(node)
+}
+
 // ---------------------------------------------------------------------------
 // Internal: scope <-> expr.VarResolver adapter with cycle detection.
 // ---------------------------------------------------------------------------

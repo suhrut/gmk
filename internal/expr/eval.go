@@ -337,6 +337,11 @@ func (e *Evaluator) evalConcat(c *Concat) (Value, error) {
 func (e *Evaluator) evalNamedCall(n *NamedCall) (Value, error) {
 	// Argument evaluation is identical across kinds, so do it once
 	// up-front before dispatching.
+	//
+	// Stage 3c.1.1: splat args are evaluated, asserted to be a Map,
+	// and their entries spread into the args map. Splat-then-named
+	// arg ordering means later-named-args win on key conflict, which
+	// is the principle-of-least-surprise rule the user expects.
 	args := make(map[string]Value, len(n.Args))
 	posIdx := 0
 	for _, a := range n.Args {
@@ -344,10 +349,19 @@ func (e *Evaluator) evalNamedCall(n *NamedCall) (Value, error) {
 		if err != nil {
 			return NewNone(), err
 		}
-		if a.Name == "" {
+		switch {
+		case a.IsSplat:
+			if v.Kind != MapKind {
+				return NewNone(), NewEvalError(n.P, nil,
+					"splat argument must be a map, got %s", v.Kind.String())
+			}
+			for k, item := range v.Map {
+				args[k] = item
+			}
+		case a.Name == "":
 			args[itoa(posIdx)] = v
 			posIdx++
-		} else {
+		default:
 			args[a.Name] = v
 		}
 	}

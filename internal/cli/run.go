@@ -10,6 +10,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/suhrut/gmk/internal/dag"
+	"github.com/suhrut/gmk/internal/expr"
+	"github.com/suhrut/gmk/internal/funcs"
 	"github.com/suhrut/gmk/internal/ir"
 	"github.com/suhrut/gmk/internal/materialize"
 	"github.com/suhrut/gmk/internal/render"
@@ -139,18 +141,115 @@ func runOneTarget(ctx context.Context, out io.Writer, project *ir.Project, t *ir
 		}
 	}
 
-	// Resolve ${...} substitutions in the target body so Stage 1
-	// behavior is preserved — body text gets project vars expanded.
-	// This is the one place where target run differs from function
-	// call: targets historically had body interpolation, functions
-	// don't (they use $GMK_ARGS instead).
-	//
-	// Stage 3c: we pass a render dispatcher so target bodies that use
-	// ${render:name(args)} expand the rendered output into the script
-	// before materialization. Without this the render: would fail at
-	// resolution time with "no render resolver configured".
+	// Stage 3c: evaluate the target's prelude (if any). Target preludes
+	// were previously deferred to "Stage 4"; this turn wires them in
+	// because the templates examples (which use ${call:fn()} in target
+	// preludes to assemble Map data for ${render:tmpl(...mapvar)})
+	// have no other natural place to live. The machinery mirrors
+	// call.go: build a call dispatcher whose Runner recursively
+	// executes functions (so nested ${call:...} works), build a render
+	// dispatcher, evaluate prelude entries in declaration order.
 	renderDisp := render.New(project.Templates, template.Default)
-	resolvedRun, err := resolve.ResolveStringInScopeWithRender(t.Run, project.RootScope, renderDisp)
+
+	var preludeValues map[string]expr.Value
+	if len(t.Prelude) > 0 {
+		var dispatch *funcs.Dispatcher
+		doRun := func(targetFn *ir.Function, boundArgs map[string]expr.Value) (expr.Value, error) {
+			fnPrelude, perr := evaluatePrelude(project, targetFn.Prelude, boundArgs, dispatch, renderDisp)
+			if perr != nil {
+				return expr.NewNone(), perr
+			}
+			// Pure-data function: prelude but no body — result is the prelude map.
+			if targetFn.Run == "" {
+				return expr.NewMap(fnPrelude), nil
+			}
+			c := materialize.CallableFromFunction(targetFn)
+			inv, merr := materialize.MaterializeCallable(c, materialize.MaterializeOpts{
+				ProjectRoot:   project.Root,
+				Store:         st,
+				Day:           day,
+				Args:          boundArgs,
+				PreludeValues: fnPrelude,
+				Languages:     project.Languages,
+				SourceFile:    targetFn.Source.File,
+			})
+			if merr != nil {
+				return expr.NewNone(), merr
+			}
+			startTime := time.Now().UTC()
+			if rerr := st.RecordStart(ctx, store.StartParams{
+				Day:          day,
+				Seq:          inv.Seq,
+				CallableName: targetFn.Name,
+				CallableKind: "function",
+				StartedAt:    startTime,
+				ArgsJSON:     jsonOrEmpty(boundArgs),
+				PreludeJSON:  jsonOrEmpty(fnPrelude),
+				SourceFile:   targetFn.Source.File,
+			}); rerr != nil {
+				return expr.NewNone(), rerr
+			}
+			res, rerr := runner.RunCallable(inv, runner.RunCallableOpts{
+				Stdout:     os.Stderr,
+				Stderr:     os.Stderr,
+				InheritEnv: true,
+			})
+			finishStatus := "ok"
+			exitCode := 0
+			if rerr != nil {
+				finishStatus = "error"
+			} else if res != nil && res.ExitCode != 0 {
+				finishStatus = "error"
+				exitCode = res.ExitCode
+			}
+			endTime := time.Now().UTC()
+			var resultJSON string
+			if res != nil {
+				if s, jerr := jsonMarshalValue(res.Value); jerr == nil {
+					resultJSON = s
+				}
+			}
+			_ = st.FinishRun(ctx, store.FinishParams{
+				Day:        day,
+				Seq:        inv.Seq,
+				FinishedAt: endTime,
+				Status:     finishStatus,
+				ExitCode:   exitCode,
+				ResultJSON: resultJSON,
+			})
+			if rerr != nil {
+				return expr.NewNone(), rerr
+			}
+			if res != nil && res.ExitCode != 0 {
+				return expr.NewNone(), fmt.Errorf("function %q body exited with code %d", targetFn.Name, res.ExitCode)
+			}
+			if res != nil {
+				return res.Value, nil
+			}
+			return expr.NewNone(), nil
+		}
+		dispatch = funcs.New(project.Functions, doRun)
+
+		var perr error
+		preludeValues, perr = evaluatePrelude(project, t.Prelude, nil, dispatch, renderDisp)
+		if perr != nil {
+			return fmt.Errorf("target %q: prelude: %w", t.Name, perr)
+		}
+	}
+
+	// Resolve ${...} substitutions in the target body. Stage 3c layers
+	// prelude bindings on top of the project root scope so the body
+	// can reference prelude vars by name (the common pattern: target
+	// prelude assembles a Map, body splats it into render).
+	var bodyVars expr.VarResolver
+	if len(preludeValues) > 0 {
+		bodyVars = &preludeScope{
+			args:    nil,
+			bound:   preludeValues,
+			project: project,
+		}
+	}
+	resolvedRun, err := resolve.ResolveStringWithVarsAndRender(t.Run, project.RootScope, bodyVars, renderDisp)
 	if err != nil {
 		return fmt.Errorf("target %q: body resolution: %w", t.Name, err)
 	}
@@ -161,15 +260,14 @@ func runOneTarget(ctx context.Context, out io.Writer, project *ir.Project, t *ir
 	c.Cwd = resolvedCwd
 
 	inv, err := materialize.MaterializeCallable(c, materialize.MaterializeOpts{
-		ProjectRoot: project.Root,
-		Store:       st,
-		Day:         day,
-		Languages:   project.Languages,
-		SourceFile:  t.Source.File,
-		// Args and PreludeValues empty: target invocation has no
-		// caller-supplied args, and prelude (if any) is evaluated
-		// when targets gain it in Stage 4. For now any Target.Prelude
-		// is honored by future work; today it's silently empty.
+		ProjectRoot:   project.Root,
+		Store:         st,
+		Day:           day,
+		Languages:     project.Languages,
+		SourceFile:    t.Source.File,
+		PreludeValues: preludeValues, // Stage 3c: now wired through
+		// Args still empty: targets don't take caller-supplied args
+		// today; that's a Stage 4 question (`gmk run target --arg k=v`).
 	})
 	if err != nil {
 		return fmt.Errorf("target %q: materialize: %w", t.Name, err)

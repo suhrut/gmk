@@ -1,0 +1,8 @@
+FROM {{ base_image }}:{{ version }}
+LABEL maintainer="{{ maintainer }}"
+LABEL org.opencontainers.image.source="{{ source_url }}"
+LABEL org.opencontainers.image.licenses="{{ license }}"
+WORKDIR /app
+COPY . .
+RUN {{ build_cmd }}
+ENTRYPOINT ["{{ entrypoint }}"]

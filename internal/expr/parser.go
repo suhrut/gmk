@@ -519,7 +519,23 @@ func (p *parser) parseNamedCallArgs() ([]NamedArg, error) {
 			return nil, err
 		}
 		var arg NamedArg
-		if first.Type == tokIdent {
+
+		// Stage 3c.1.1: splat. `...expr` spreads a Map value's keys
+		// into the args. Splat is always positional in shape (no
+		// `name=...expr` form) and counts as "named" for the
+		// positional-before-named ordering check, because the
+		// resolved keys are named.
+		if first.Type == tokSplat {
+			if _, err := p.lex.Next(); err != nil { // consume ...
+				return nil, err
+			}
+			val, err := p.parsePipeline()
+			if err != nil {
+				return nil, err
+			}
+			arg = NamedArg{Value: val, IsSplat: true}
+			sawNamed = true
+		} else if first.Type == tokIdent {
 			// Save position so we can rewind if it's not a named arg.
 			savedPos := p.lex.SavePos()
 			_, _ = p.lex.Next() // consume ident

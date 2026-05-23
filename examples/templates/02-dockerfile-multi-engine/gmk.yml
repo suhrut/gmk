@@ -1,0 +1,45 @@
+# Stage 3c example #2: the same Dockerfile rendered by two engines,
+# side by side, so you can pick which you prefer for your project.
+#
+# What this teaches:
+#   - `file:` reference form (relative to declaring YAML)
+#   - Explicit `engine:` selection per template
+#   - Identical data shapes; different rendering syntax
+#   - Conditional inclusion (if build_cmd / if expose_port)
+#
+# The two templates produce identical output. Compare the source
+# files to see how each engine expresses conditionals:
+#
+#   templates/dockerfile.jinja    — {% if x %}...{% endif %}
+#   templates/dockerfile.gotmpl   — {{if .x}}...{{end}}
+#
+# Try it:
+#   gmk run emit-go-jinja        # use the jinja-engine template
+#   gmk run emit-go-gotmpl       # use the go-engine template
+#   diff /tmp/Dockerfile.from-jinja /tmp/Dockerfile.from-go
+
+templates:
+  dockerfile-jinja:
+    engine: jinja
+    file: templates/dockerfile.jinja
+    doc: Application Dockerfile, Jinja-style.
+
+  dockerfile-gotmpl:
+    engine: go
+    file: templates/dockerfile.gotmpl
+    doc: Application Dockerfile, Go-text/template-style.
+
+targets:
+  emit-go-jinja:
+    run: |
+      cat > /tmp/Dockerfile.from-jinja <<'DOCKERFILE'
+      ${render:dockerfile-jinja(base_image="golang", version="1.22", entrypoint="/usr/local/bin/myapp", build_cmd="go build -o /usr/local/bin/myapp ./cmd/myapp", expose_port="8080")}
+      DOCKERFILE
+      cat /tmp/Dockerfile.from-jinja
+
+  emit-go-gotmpl:
+    run: |
+      cat > /tmp/Dockerfile.from-go <<'DOCKERFILE'
+      ${render:dockerfile-gotmpl(base_image="golang", version="1.22", entrypoint="/usr/local/bin/myapp", build_cmd="go build -o /usr/local/bin/myapp ./cmd/myapp", expose_port="8080")}
+      DOCKERFILE
+      cat /tmp/Dockerfile.from-go

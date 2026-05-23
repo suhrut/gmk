@@ -223,3 +223,107 @@ Modified:
 - cmd/gmk/main.go (blank-import jinja; template.SetDefault("jinja"))
 - README.md (Project layout section mentions templates)
 - docs/LAYOUT.md (new Templates section)
+
+---
+
+## Stage 3c.1.2 follow-on (in this tarball)
+
+Two additions on top of the templates work:
+
+### 1. Splat operator `${render:tmpl(...mapvar)}`
+
+The original `${render:tmpl(k1=v1, k2=v2)}` required enumerating every
+template arg by name. For real workloads where the data shape is
+assembled upstream (function returns a Map, JSON load, etc.), this
+is verbose:
+
+```yaml
+# Before (verbose):
+"${render:k8s-deployment(name=cfg.name, image=cfg.image, port=cfg.port, ...)}"
+
+# After (splat):
+"${render:k8s-deployment(...cfg)}"
+```
+
+Mechanics:
+- Lexer: new `tokSplat` for `...`
+- Parser: `parseNamedCallArgs` recognizes `...EXPR` and produces
+  `NamedArg{Value: EXPR, IsSplat: true}`
+- Eval: at arg collection, splat values are asserted to be Maps
+  (clear error otherwise); entries spread into the args map
+- Conflict resolution: later wins. Splat-then-named lets named
+  args override; two splats (`...defaults, ...overrides`) lets the
+  later splat override the earlier.
+
+Splat works for `${call:fn(...)}` too — the mechanism is in the
+kind-agnostic arg collection.
+
+Tests: 7 new (`internal/expr/splat_test.go`).
+
+### 2. Target preludes wired into `gmk run`
+
+Previously target preludes were "honored by future work" — a `target:
+{ prelude: {...}, run: ... }` would parse fine but the prelude was
+silently empty at body interpolation time. The templates examples
+needed target preludes to assemble Map data, so this turn wired them
+in:
+
+- `runOneTarget` builds a `funcs.Dispatcher` + `render.Dispatcher`
+- `evaluatePrelude` (from call.go) is called against the target's
+  prelude with both dispatchers
+- Resulting bound values are layered via `preludeScope` on top of the
+  project scope for body interpolation
+- Bound values are also passed as `PreludeValues` to
+  `MaterializeCallable` so the body's `$GMK_PRELUDE` is populated
+
+New: `resolve.ResolveStringWithVarsAndRender(s, sc, extraVars, renders)`
+— the most general form, accepts an explicit VarResolver for callers
+that need to layer scopes. The previous two variants stay as thin
+wrappers.
+
+### 3. Examples library
+
+`examples/templates/` now has five examples (was one):
+
+1. `01-inline-header` — simplest, inline body
+2. `02-dockerfile-multi-engine` — file refs, jinja vs go side-by-side
+3. `03-k8s-deployment` — function-body-returns-JSON + splat
+4. `04-nginx-config` — Python function builds list-of-maps; jinja filters
+5. `05-splat-and-defaults` — splat + override patterns, two-splat merging
+
+Plus a top-level `examples/templates/README.md` indexing them.
+
+### Test driver fixes
+
+- `internal/integration/main_test.go` — new `TestMain` mirrors
+  `cmd/gmk/main.go`'s engine registration: blank-imports
+  `internal/template/jinja` (no-op under `-tags nogonja`) and calls
+  `template.SetDefault("jinja")`.
+- `exampleNeedsMissingEngine` helper: walks a project's Templates,
+  returns the name of any engine that isn't registered (or
+  `"(default)"` if the default isn't resolvable). Used by both
+  `TestExamplesRun` and `TestExamplesTargetsConsistent` to skip
+  jinja-dependent examples cleanly under `-tags nogonja` rather
+  than fail with cryptic errors.
+
+### Counts (final)
+
+- 17 packages green
+- 7 new splat tests added
+- All 5 templates examples pass the integration consistency check
+- All 5 templates examples skip cleanly under `-tags nogonja`
+- Target prelude end-to-end verified by running the actual `gmk`
+  binary against a synthetic splat-uses-prelude project
+
+### Known limitations (Stage 3c.2 or later)
+
+- **Vars and prelude are scalar-only at the YAML loader.** Structured
+  Maps/Lists have to live in function results (return JSON via
+  `$GMK_RESULT`). Loader work to accept structured literals in
+  `vars:` / `prelude:` is its own chunk; defer.
+- **Targets still don't take caller-supplied args** (`gmk run target
+  --arg k=v`). That's the Stage 4 question on how target args
+  compose with deps.
+- **Cross-file template merging from includes** — same situation as
+  before; no template imported via `includes:` becomes visible at
+  the consumer's lookup. Revisit when first real-world use case lands.

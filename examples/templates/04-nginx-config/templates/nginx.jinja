@@ -1,0 +1,40 @@
+worker_processes {{ worker_processes | default(2) }};
+
+events {
+    worker_connections {{ worker_connections | default(1024) }};
+}
+
+http {
+    {% if upstreams %}
+    {% for name, servers in upstreams.items() %}
+    upstream {{ name }} {
+        {% for server in servers %}
+        server {{ server }};
+        {% endfor %}
+    }
+    {% endfor %}
+    {% endif %}
+
+    {% for site in sites %}
+    server {
+        listen {{ site.port | default(80) }};
+        server_name {{ site.hostname }};
+        {% if site.tls %}
+        listen 443 ssl;
+        ssl_certificate     /etc/nginx/certs/{{ site.hostname }}.pem;
+        ssl_certificate_key /etc/nginx/certs/{{ site.hostname }}.key;
+        {% endif %}
+
+        {% for loc in site.locations %}
+        location {{ loc.path }} {
+            {% if loc.proxy_pass %}proxy_pass {{ loc.proxy_pass }};
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            {% elif loc.root %}root {{ loc.root }};
+            try_files $uri $uri/ =404;
+            {% endif %}
+        }
+        {% endfor %}
+    }
+    {% endfor %}
+}

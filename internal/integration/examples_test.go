@@ -162,6 +162,11 @@ func TestExamplesTargetsConsistent(t *testing.T) {
 			if err != nil {
 				t.Fatalf("load: %v", err)
 			}
+			// Stage 3c: skip examples that need an engine this
+			// build doesn't include — same logic as TestExamplesRun.
+			if missing := exampleNeedsMissingEngine(p.Templates); missing != "" {
+				t.Skipf("skipping: template engine %q not available in this build", missing)
+			}
 			// Stage 3c: examples may use ${render:tmpl(args)} in their
 			// target bodies. Build a render dispatcher from the project's
 			// templates so resolution doesn't fail with "no render
@@ -278,6 +283,17 @@ func TestExamplesRun(t *testing.T) {
 			project, err := load.Load(f)
 			if err != nil {
 				t.Fatalf("load: %v", err)
+			}
+
+			// Stage 3c: skip examples that need a template engine
+			// this build doesn't include. The most common case is
+			// -tags nogonja excluding jinja: the binary still works
+			// for `engine: go` projects, but a project using the
+			// default engine (jinja) can't be rendered. We skip
+			// rather than fail so test runs are useful in both
+			// build configurations.
+			if missing := exampleNeedsMissingEngine(project.Templates); missing != "" {
+				t.Skipf("skipping: template engine %q not available in this build", missing)
 			}
 
 			// Cleanup any .gmk-cache the test creates so reruns are clean.

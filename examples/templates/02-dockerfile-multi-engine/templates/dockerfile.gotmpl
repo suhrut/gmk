@@ -1,0 +1,6 @@
+FROM {{.base_image}}:{{.version}}
+WORKDIR /app
+COPY . .
+{{if .build_cmd}}RUN {{.build_cmd}}
+{{end}}{{if .expose_port}}EXPOSE {{.expose_port}}
+{{end}}ENTRYPOINT ["{{.entrypoint}}"]

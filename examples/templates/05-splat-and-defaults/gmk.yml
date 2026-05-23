@@ -1,0 +1,90 @@
+# Stage 3c example #5: the splat operator ${render:tmpl(...mapvar)}.
+# Demonstrates passing pre-assembled Maps as render args, spreading
+# their keys into the template context instead of writing
+# {{ mapname.field }} for every field.
+#
+# What this teaches:
+#   - `...mapvar` splat syntax
+#   - Combining splat with named-arg overrides (named wins on conflict)
+#   - The "project-wide defaults" pattern: one defaults Map + splat
+#     everywhere, named args override per-call
+#   - Two splats: later wins on conflict
+#   - Function-body-returns-JSON as the home for structured Maps
+#
+# Try it:
+#   gmk run emit-default        # uses only defaults via splat
+#   gmk run emit-with-override  # splat + per-call override
+#   gmk run emit-go             # splat defaults + splat go-specific overrides
+
+functions:
+  # Project-wide defaults. Stored as one Map (function body writes
+  # JSON) and splatted into every render so individual targets don't
+  # repeat them.
+  oci-defaults:
+    result: {type: map}
+    run: |
+      cat > "$GMK_RESULT" << 'JSON'
+      {
+        "base_image": "alpine",
+        "version": "3.19",
+        "maintainer": "ops@example.com",
+        "source_url": "https://github.com/myorg/myrepo",
+        "license": "Apache-2.0",
+        "build_cmd": "true",
+        "entrypoint": "/usr/local/bin/myapp"
+      }
+      JSON
+
+  # Per-language override sets.
+  go-overrides:
+    result: {type: map}
+    run: |
+      cat > "$GMK_RESULT" << 'JSON'
+      {
+        "base_image": "golang",
+        "version": "1.22",
+        "build_cmd": "go build -o /usr/local/bin/myapp ./cmd/myapp"
+      }
+      JSON
+
+templates:
+  oci-dockerfile:
+    engine: jinja
+    file: templates/dockerfile.jinja
+    doc: A labeled Dockerfile; all args come from splatted maps in practice.
+
+targets:
+  # Pure-defaults form: every field from oci-defaults, no per-call args.
+  # Demonstrates that ...defaults alone is a complete arg list.
+  emit-default:
+    prelude:
+      defaults: "${call:oci-defaults()}"
+    run: |
+      cat > /tmp/Dockerfile.default << 'EOF2'
+      ${render:oci-dockerfile(...defaults)}
+      EOF2
+      cat /tmp/Dockerfile.default
+
+  # Splat + named override. The named `version` wins over the value
+  # in the splatted defaults (later wins on conflict; named is later).
+  emit-with-override:
+    prelude:
+      defaults: "${call:oci-defaults()}"
+    run: |
+      cat > /tmp/Dockerfile.pinned << 'EOF2'
+      ${render:oci-dockerfile(...defaults, version="3.20-rc1")}
+      EOF2
+      cat /tmp/Dockerfile.pinned
+
+  # Two splats. The go-overrides map wins on keys it shares with
+  # oci-defaults (base_image, version, build_cmd). Other defaults
+  # flow through untouched.
+  emit-go:
+    prelude:
+      defaults: "${call:oci-defaults()}"
+      go_overlay: "${call:go-overrides()}"
+    run: |
+      cat > /tmp/Dockerfile.go << 'EOF2'
+      ${render:oci-dockerfile(...defaults, ...go_overlay)}
+      EOF2
+      cat /tmp/Dockerfile.go

@@ -1,0 +1,6 @@
+FROM {{ base_image }}:{{ version }}
+WORKDIR /app
+COPY . .
+{% if build_cmd %}RUN {{ build_cmd }}
+{% endif %}{% if expose_port %}EXPOSE {{ expose_port }}
+{% endif %}ENTRYPOINT ["{{ entrypoint }}"]
