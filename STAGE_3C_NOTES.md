@@ -582,3 +582,118 @@ needed.
   the body lives under `.gmk-cache/bodies/<hash>/` keyed by callable
   content hash — would need to recompute the hash or have the runner
   record it on the row)
+
+---
+
+## Demo: fullstack-app + local-registry (May 23 2026)
+
+Created `demo/` to validate that the Stage 3c.2 feature set is
+sufficient for a real deployment pipeline — no new features added.
+
+Two demos:
+
+- `demo/local-registry/` — Zot OCI registry lifecycle (5 targets,
+  ~75 lines). Standalone, reusable building block.
+
+- `demo/fullstack-app/` — full pipeline: PKI bootstrap (raw password
+  from `~/.gmk/<project>/key`), local Zot, Go backend + plain
+  HTML/JS frontend + Postgres on k3s, OCI bundle for prod-host
+  deploy without git-clone. ~650 lines of gmk.yml, ~750 lines of
+  source + templates total. 38 targets, 1 Python function.
+
+What the demo validated:
+
+- Structured vars (nested maps + lists) for backend/frontend/postgres/ingress.
+- Splat operator on structured vars: `${render:tmpl(...ingress, extra=foo)}`.
+- Iteration combinator: `${map:render-app-manifest(items=apps, ...)}`
+  drives a Python function that renders N manifests with no per-app
+  target duplication.
+- Multi-language fan-out: bash targets + one Python function with
+  JSON IPC via `GMK_ARGS` / `GMK_RESULT`.
+- Templates (jinja for the real demo, validated equivalently with
+  `go` engine in the sandbox since jinja needs Go 1.24+ and sandbox
+  is on 1.22).
+- Deep `deps:` chains (5 levels: all → deploy → bundle → manifests → pki).
+- Target preludes via `env:` block.
+
+### Limitation surfaced: includes promote vars but not targets/functions/templates
+
+Tried the natural layout `demo/fullstack-app/gmk/{pki,registry,images,...}.yml`
+with the top-level gmk.yml using:
+
+```yaml
+includes:
+  - ./gmk/pki.yml
+  - ./gmk/registry.yml
+  ...
+```
+
+Included files load fine — their vars get promoted into the parent
+scope — but their targets/functions/templates are stored under
+`p.RootScope.Includes[]` as a sub-Project, not merged into the parent's
+top-level maps. So `gmk run goodbye` where `goodbye` lives in an
+included file fails with "target not found".
+
+Tested with minimal repro (/tmp/test-incl2):
+- `vars` in included file → ✓ visible in parent
+- `targets` in included file → ✗ not callable
+- Same for functions and templates.
+
+Consolidated the fullstack-app demo into one 650-line `gmk.yml` with
+section comments instead. Documented the limitation in the gmk.yml
+header and in `demo/fullstack-app/README.md`.
+
+Not fixing in this stage — user explicitly said "no new features."
+This belongs in a future stage as part of a broader "modules /
+sub-projects" design (which also needs to think through:
+namespacing of merged target names, visibility of parent vars from
+inside an included file, include-time vs run-time vars).
+
+### Other minor friction notes (not bugs, just things to know)
+
+- Bash heredocs inside YAML block scalars: terminator line at column 0
+  breaks the YAML block scalar. Fix: use `printf` / `echo` lines, or
+  indent the heredoc terminator to match the block scalar's indent
+  (which then requires `<<-` and tabs in bash — fragile).
+- Function bodies can't use `${render:...}` (it's a gmk expression-
+  context construct). For per-app manifest rendering driven by `map:`,
+  the function uses Python's own jinja2 instead. Works fine, but
+  worth noting that "render from inside a function" is awkward today.
+
+### Files
+
+```
+demo/
+├── README.md
+├── local-registry/
+│   ├── README.md
+│   └── gmk.yml
+└── fullstack-app/
+    ├── README.md
+    ├── gmk.yml
+    ├── backend/
+    │   ├── README.md
+    │   ├── Dockerfile
+    │   ├── go.mod
+    │   └── main.go
+    ├── frontend/
+    │   ├── Dockerfile
+    │   ├── app.js
+    │   ├── index.html
+    │   ├── nginx.conf
+    │   └── style.css
+    └── templates/
+        ├── app.yaml.jinja
+        ├── ingress.yaml.jinja
+        ├── install.sh.jinja
+        ├── namespace.yaml.jinja
+        └── postgres.yaml.jinja
+```
+
+Validation in the sandbox (without docker/k3s/openssl/oras/jinja):
+- `gmk list -f demo/fullstack-app/gmk.yml` → 38 targets, 1 function ✓
+- `gmk dryrun all -f demo/fullstack-app/gmk.yml` → 28-step linear order ✓
+- Render chain validated end-to-end with `go` engine on a parallel
+  /tmp project: ${render:tmpl(...mapvar, extra=x)} splat works,
+  ${map:fn(items=list, ...)} drives a Python function correctly,
+  output files written correctly.

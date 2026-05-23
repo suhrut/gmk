@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>fullstack-app demo</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>fullstack-app</h1>
+    <p class="subtitle">gmk demo · go backend · postgres · k3s</p>
+  </header>
+
+  <main>
+    <section id="status-section">
+      <h2>backend status</h2>
+      <p id="status">checking...</p>
+    </section>
+
+    <section id="messages-section">
+      <div class="messages-header">
+        <h2>messages</h2>
+        <button id="refresh-btn">refresh</button>
+      </div>
+      <ul id="messages"><li class="loading">loading...</li></ul>
+    </section>
+  </main>
+
+  <footer>
+    <p>served by nginx · proxied to /api · gmk demo</p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,83 @@
+---
+# Deployment + Service for app "{{ name }}".
+# This template is rendered once per app in vars.apps[] via the
+# render-app-manifest function driven by ${map:...}.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ name }}
+  namespace: {{ namespace }}
+  labels:
+    app: {{ name }}
+    app.kubernetes.io/name: {{ name }}
+    app.kubernetes.io/version: {{ version }}
+spec:
+  replicas: {{ replicas }}
+  selector:
+    matchLabels:
+      app: {{ name }}
+  template:
+    metadata:
+      labels:
+        app: {{ name }}
+        app.kubernetes.io/version: {{ version }}
+    spec:
+      containers:
+        - name: {{ name }}
+          image: {{ registry }}/{{ image_repo }}:{{ version }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: {{ port }}
+{% if name == "backend" %}
+          env:
+            - name: DB_HOST
+              value: postgres
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_DB
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_PASSWORD
+            - name: PORT
+              value: "{{ port }}"
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: {{ port }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+{% endif %}
+{% if name == "frontend" %}
+          readinessProbe:
+            httpGet:
+              path: /
+              port: {{ port }}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+{% endif %}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ name }}
+  namespace: {{ namespace }}
+spec:
+  selector:
+    app: {{ name }}
+  ports:
+    - port: {{ port }}
+      targetPort: {{ port }}
+      name: http
+  type: ClusterIP

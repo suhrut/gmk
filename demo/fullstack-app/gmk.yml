@@ -1,0 +1,651 @@
+# demo/fullstack-app — full deployment pipeline.
+#
+# This project demonstrates that gmk's Stage 3c.2 feature set is
+# sufficient to model a real-world deployment workflow:
+#
+#   1. Bootstrap a self-signed CA (raw password from
+#      ~/.gmk/<project>/key or ~/.gmk/key)
+#   2. Run a local Zot OCI registry
+#   3. Build a Go backend + plain HTML/JS frontend into container
+#      images, push to Zot
+#   4. Generate k8s manifests from structured vars + jinja templates,
+#      using ${map:...} to iterate over apps
+#   5. Bundle (manifests + CA cert + install.sh) as an OCI artifact
+#      and push to Zot
+#   6. On the prod host: oras pull the bundle, run install.sh which
+#      kubectl-applies against k3s. No git clone needed.
+#
+# === ORGANISATIONAL NOTE ===
+#
+# This file is large because gmk's include: mechanism currently
+# promotes ONLY vars from included files — targets, functions, and
+# templates in included files aren't reachable from the parent
+# project's command line. So the natural module split (gmk/pki.yml,
+# gmk/registry.yml, ...) doesn't work today, and we consolidate
+# everything here with section comments instead.
+#
+# Promoting targets/functions/templates from includes is a real
+# limitation surfaced by this demo. Filed as a gap for a future
+# stage; see README.md.
+#
+# === TOP-LEVEL TARGETS ===
+#
+#   gmk run setup       — PKI + registry boot
+#   gmk run build       — backend + frontend images, pushed
+#   gmk run manifests   — k8s YAML generated
+#   gmk run bundle      — OCI artifact, pushed to Zot
+#   gmk run deploy      — prod-side pull + kubectl apply
+#   gmk run all         — the whole thing end-to-end
+
+vars:
+  # ---- Project identity ----
+  project:   "fullstack-app"
+  namespace: "fullstack-app"
+
+  # ---- Registry ----
+  registry:  "localhost:5000"
+  version:   "v0.1.0"
+
+  # ---- Generated artifact locations ----
+  out_dir:        ".gmk-cache/out"
+  manifests_dir:  ".gmk-cache/out/manifests"
+  pki_dir:        ".gmk-cache/out/pki"
+  bundle_staging: ".gmk-cache/out/bundle"
+  deploy_staging: ".gmk-cache/deploy"
+
+  # ---- Backend app ----
+  backend:
+    name:        "backend"
+    image_repo:  "fullstack-app/backend"
+    port:        8080
+    replicas:    2
+    db_host:     "postgres"
+    db_port:     5432
+    db_name:     "appdb"
+    db_user:     "appuser"
+
+  # ---- Frontend app ----
+  frontend:
+    name:        "frontend"
+    image_repo:  "fullstack-app/frontend"
+    port:        80
+    replicas:    2
+    api_url:     "http://backend"
+
+  # ---- Postgres ----
+  postgres:
+    name:       "postgres"
+    image:      "postgres:16-alpine"
+    port:       5432
+    db_name:    "appdb"
+    db_user:    "appuser"
+    pvc_size:   "1Gi"
+
+  # ---- Ingress (traefik in k3s) ----
+  ingress:
+    host:           "fullstack-app.local"
+    tls_secret:     "fullstack-app-tls"
+    backend_path:   "/api"
+    frontend_path:  "/"
+
+  # The list-of-apps form is what the iteration combinators consume.
+  # Same data as backend/frontend above, in iterable form.
+  apps:
+    - {name: "backend",  image_repo: "fullstack-app/backend",  port: 8080, replicas: 2}
+    - {name: "frontend", image_repo: "fullstack-app/frontend", port: 80,   replicas: 2}
+
+  # ---- PKI parameters ----
+  ca_subject:     "/C=US/O=FullstackApp Demo/CN=FullstackApp Demo CA"
+  server_subject: "/C=US/O=FullstackApp Demo/CN=fullstack-app.local"
+  ca_days:        3650
+  server_days:    365
+
+  # ---- Zot registry container ----
+  zot_container: "gmk-zot-fullstack"
+  zot_image:     "ghcr.io/project-zot/zot-linux-amd64:latest"
+  zot_volume:    "gmk-zot-fullstack-data"
+
+
+# === TEMPLATES ===
+
+templates:
+  namespace:
+    engine: jinja
+    file: ./templates/namespace.yaml.jinja
+    doc: k8s Namespace.
+
+  postgres:
+    engine: jinja
+    file: ./templates/postgres.yaml.jinja
+    doc: Postgres StatefulSet + Service + PVC.
+
+  ingress:
+    engine: jinja
+    file: ./templates/ingress.yaml.jinja
+    doc: Traefik Ingress.
+
+  install-script:
+    engine: jinja
+    file: ./templates/install.sh.jinja
+    doc: install.sh bundled into the OCI artifact for prod-host use.
+
+
+# === FUNCTIONS ===
+
+functions:
+  # Render one app's Deployment+Service to ${out_dir}/<name>.yaml.
+  # Driven by ${map:render-app-manifest(items=apps, ...)}.
+  # Uses Python's jinja2 directly (NOT gmk's ${render:...}) because
+  # gmk's render only works in expression position, not from inside
+  # a function body. Same Jinja2 syntax either way.
+  render-app-manifest:
+    lang: python
+    params:
+      - {name: item,          type: map}
+      - {name: out_dir,       type: string}
+      - {name: template_path, type: string}
+      - {name: registry,      type: string}
+      - {name: version,       type: string}
+      - {name: namespace,     type: string}
+    result: {type: string}
+    run: |
+      import json, os, sys
+      try:
+          from jinja2 import Environment, FileSystemLoader
+      except ImportError:
+          print("FATAL: python jinja2 not available. install with: pip install jinja2", file=sys.stderr)
+          raise SystemExit(1)
+
+      args = json.load(open(os.environ["GMK_ARGS"]))
+      item = args.get("item") or {}
+      out_dir = args["out_dir"]
+      tmpl_path = args["template_path"]
+
+      env = Environment(
+          loader=FileSystemLoader(os.path.dirname(tmpl_path) or "."),
+          trim_blocks=True,
+          lstrip_blocks=True,
+      )
+      tmpl = env.get_template(os.path.basename(tmpl_path))
+
+      rendered = tmpl.render(
+          name       = item.get("name", "unknown"),
+          image_repo = item.get("image_repo", ""),
+          port       = item.get("port", 0),
+          replicas   = item.get("replicas", 1),
+          registry   = args["registry"],
+          version    = args["version"],
+          namespace  = args["namespace"],
+      )
+
+      os.makedirs(out_dir, exist_ok=True)
+      out_path = os.path.join(out_dir, f"{item.get('name', 'app')}.yaml")
+      with open(out_path, "w") as f:
+          f.write(rendered)
+      json.dump(out_path, open(os.environ["GMK_RESULT"], "w"))
+
+
+# === TARGETS ===
+
+targets:
+
+  # =====================================================================
+  # Section 1: PKI bootstrap (reads raw password from ~/.gmk/...)
+  # =====================================================================
+
+  pki-ca:
+    doc: |
+      Generate the encrypted CA key + self-signed CA cert.
+      Reads the password from ~/.gmk/${project}/key (preferred) or
+      ~/.gmk/key (fallback). Idempotent — skips if ca.crt exists.
+    run: |
+      set -e
+      mkdir -p "${pki_dir}"
+
+      if [ -f "${pki_dir}/ca.crt" ]; then
+        echo "CA already exists at ${pki_dir}/ca.crt — skipping"
+        echo "(delete it to force regeneration)"
+        exit 0
+      fi
+
+      project_pw="$HOME/.gmk/${project}/key"
+      global_pw="$HOME/.gmk/key"
+      if [ -f "$project_pw" ]; then
+        pw_file="$project_pw"
+        echo "using password file: $pw_file (project-specific)"
+      elif [ -f "$global_pw" ]; then
+        pw_file="$global_pw"
+        echo "using password file: $pw_file (global fallback)"
+      else
+        echo "no CA password file found." >&2
+        echo "" >&2
+        echo "Create one with a single line containing the desired password:" >&2
+        echo "" >&2
+        echo "    mkdir -p ~/.gmk/${project} && \\" >&2
+        echo "    chmod 700 ~/.gmk/${project} && \\" >&2
+        echo "    printf '%s' 'your-strong-passphrase' > ~/.gmk/${project}/key && \\" >&2
+        echo "    chmod 600 ~/.gmk/${project}/key" >&2
+        echo "" >&2
+        echo "Or use the global fallback at ~/.gmk/key." >&2
+        exit 1
+      fi
+
+      echo "generating CA key (aes256-encrypted) ..."
+      openssl genrsa -aes256 -passout "file:$pw_file" -out "${pki_dir}/ca.key" 4096
+
+      echo "generating self-signed CA cert ..."
+      openssl req -x509 -new -sha256 \
+        -key "${pki_dir}/ca.key" -passin "file:$pw_file" \
+        -days "${ca_days}" \
+        -subj "${ca_subject}" \
+        -out "${pki_dir}/ca.crt"
+
+      chmod 600 "${pki_dir}/ca.key"
+      chmod 644 "${pki_dir}/ca.crt"
+      echo "done."
+
+  pki-server-cert:
+    doc: |
+      Generate the server cert signed by the CA (unencrypted key,
+      since ingress controllers expect that). SAN list includes the
+      ingress host plus localhost.
+    deps: [pki-ca]
+    run: |
+      set -e
+      if [ -f "${pki_dir}/server.crt" ]; then
+        echo "server cert already exists — skipping"
+        exit 0
+      fi
+
+      project_pw="$HOME/.gmk/${project}/key"
+      global_pw="$HOME/.gmk/key"
+      if [ -f "$project_pw" ]; then pw_file="$project_pw"; else pw_file="$global_pw"; fi
+
+      san_conf="${pki_dir}/server-san.cnf"
+      printf 'subjectAltName = DNS:%s, DNS:localhost, IP:127.0.0.1\n' \
+        "${ingress.host}" > "$san_conf"
+
+      openssl genrsa -out "${pki_dir}/server.key" 4096
+      openssl req -new \
+        -key "${pki_dir}/server.key" \
+        -subj "${server_subject}" \
+        -out "${pki_dir}/server.csr"
+      openssl x509 -req -sha256 \
+        -in "${pki_dir}/server.csr" \
+        -CA "${pki_dir}/ca.crt" \
+        -CAkey "${pki_dir}/ca.key" -passin "file:$pw_file" \
+        -CAcreateserial \
+        -days "${server_days}" \
+        -extfile "$san_conf" \
+        -out "${pki_dir}/server.crt"
+
+      chmod 600 "${pki_dir}/server.key"
+      chmod 644 "${pki_dir}/server.crt"
+      echo "done."
+
+  pki-show-ca:
+    doc: Print the CA cert text. For sanity-checking the bootstrap.
+    run: |
+      if [ ! -f "${pki_dir}/ca.crt" ]; then
+        echo "no CA cert yet — run 'gmk run pki-ca'" >&2
+        exit 1
+      fi
+      openssl x509 -in "${pki_dir}/ca.crt" -text -noout | head -20
+
+  pki-all:
+    doc: PKI bootstrap (CA + server cert). Idempotent.
+    deps: [pki-ca, pki-server-cert]
+    run: |
+      echo "PKI ready at ${pki_dir}/"
+
+  pki-clean:
+    doc: Remove all PKI artifacts. Does NOT delete the password file.
+    run: |
+      rm -rf "${pki_dir}"
+      echo "wiped ${pki_dir}/"
+
+  # =====================================================================
+  # Section 2: Local Zot registry lifecycle
+  # =====================================================================
+
+  registry-ensure:
+    doc: Boot Zot if not already running. Idempotent.
+    run: |
+      set -e
+      port="${registry##*:}"
+
+      if docker ps --format '{{.Names}}' | grep -q "^${zot_container}$"; then
+        echo "registry already running: http://${registry}"
+        exit 0
+      fi
+      docker rm -f "${zot_container}" 2>/dev/null || true
+
+      echo "starting Zot on ${registry} ..."
+      docker run -d \
+        --name "${zot_container}" \
+        --restart unless-stopped \
+        -p "${port}:5000" \
+        -v "${zot_volume}:/var/lib/registry" \
+        "${zot_image}" >/dev/null
+
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        if curl -fsS "http://${registry}/v2/" >/dev/null 2>&1; then
+          echo "registry ready: http://${registry}"
+          exit 0
+        fi
+        sleep 1
+      done
+      echo "registry did not become ready in 10s" >&2
+      docker logs "${zot_container}" >&2
+      exit 1
+
+  registry-stop:
+    doc: Stop the registry container. Volume preserved.
+    run: |
+      docker rm -f "${zot_container}" 2>/dev/null && \
+        echo "stopped ${zot_container}" || \
+        echo "${zot_container} was not running"
+
+  registry-catalog:
+    doc: List repositories currently in the registry.
+    run: |
+      curl -fsS "http://${registry}/v2/_catalog" 2>/dev/null | \
+        python3 -m json.tool 2>/dev/null || \
+        { echo "registry not reachable at ${registry}" >&2; exit 1; }
+
+  registry-reset:
+    doc: Destroy the registry container AND its data volume.
+    run: |
+      docker rm -f "${zot_container}" 2>/dev/null || true
+      docker volume rm "${zot_volume}" 2>/dev/null || true
+      echo "registry destroyed"
+
+  # =====================================================================
+  # Section 3: Image build & push
+  # =====================================================================
+
+  images-backend-binary:
+    doc: Compile the Go backend (static, linux/amd64) into backend/build/server.
+    cwd: backend
+    env:
+      CGO_ENABLED: "0"
+      GOOS: "linux"
+      GOARCH: "amd64"
+    run: |
+      set -e
+      mkdir -p build
+      go build -trimpath -ldflags "-s -w" -o build/server ./...
+      echo "built backend/build/server"
+
+  images-backend-image:
+    doc: Build the backend container image.
+    deps: [images-backend-binary]
+    cwd: backend
+    run: |
+      set -e
+      tag_v="${registry}/${backend.image_repo}:${version}"
+      tag_l="${registry}/${backend.image_repo}:latest"
+      docker build -t "$tag_v" -t "$tag_l" .
+      echo "built $tag_v"
+
+  images-backend-push:
+    doc: Push the backend image to Zot.
+    deps: [images-backend-image, registry-ensure]
+    run: |
+      set -e
+      tag_v="${registry}/${backend.image_repo}:${version}"
+      tag_l="${registry}/${backend.image_repo}:latest"
+      docker push "$tag_v"
+      docker push "$tag_l"
+      echo "pushed $tag_v"
+
+  images-frontend-image:
+    doc: Build the frontend container image (nginx + static files).
+    cwd: frontend
+    run: |
+      set -e
+      tag_v="${registry}/${frontend.image_repo}:${version}"
+      tag_l="${registry}/${frontend.image_repo}:latest"
+      docker build -t "$tag_v" -t "$tag_l" .
+      echo "built $tag_v"
+
+  images-frontend-push:
+    doc: Push the frontend image to Zot.
+    deps: [images-frontend-image, registry-ensure]
+    run: |
+      set -e
+      tag_v="${registry}/${frontend.image_repo}:${version}"
+      tag_l="${registry}/${frontend.image_repo}:latest"
+      docker push "$tag_v"
+      docker push "$tag_l"
+      echo "pushed $tag_v"
+
+  images-all:
+    doc: Build and push both images.
+    deps: [images-backend-push, images-frontend-push]
+    run: |
+      echo "all images pushed"
+
+  # =====================================================================
+  # Section 4: K8s manifest generation
+  # =====================================================================
+
+  manifests-namespace:
+    doc: Render the Namespace manifest.
+    run: |
+      mkdir -p "${manifests_dir}"
+      cat > "${manifests_dir}/00-namespace.yaml" <<MANIFEST
+      ${render:namespace(namespace=namespace, project=project, version=version)}
+      MANIFEST
+      echo "wrote ${manifests_dir}/00-namespace.yaml"
+
+  manifests-postgres:
+    doc: Render Postgres StatefulSet + Service + PVC.
+    run: |
+      mkdir -p "${manifests_dir}"
+      cat > "${manifests_dir}/10-postgres.yaml" <<MANIFEST
+      ${render:postgres(...postgres, namespace=namespace)}
+      MANIFEST
+      echo "wrote ${manifests_dir}/10-postgres.yaml"
+
+  manifests-apps:
+    doc: |
+      Render Deployment+Service for every app in `apps`. Uses
+      ${map:render-app-manifest(items=apps, ...)} so adding a third
+      app means adding one row to vars.apps, not editing this target.
+    run: |
+      mkdir -p "${manifests_dir}"
+      echo 'rendered:'
+      echo '  ${join(map:render-app-manifest(items=apps, out_dir=manifests_dir, template_path="templates/app.yaml.jinja", registry=registry, version=version, namespace=namespace), " ")}'
+
+  manifests-ingress:
+    doc: Render the Ingress manifest.
+    run: |
+      mkdir -p "${manifests_dir}"
+      cat > "${manifests_dir}/90-ingress.yaml" <<MANIFEST
+      ${render:ingress(...ingress, namespace=namespace, backend_name=backend.name, backend_port=backend.port, frontend_name=frontend.name, frontend_port=frontend.port)}
+      MANIFEST
+      echo "wrote ${manifests_dir}/90-ingress.yaml"
+
+  manifests-all:
+    doc: Generate every k8s manifest into ${manifests_dir}.
+    deps:
+      - manifests-namespace
+      - manifests-postgres
+      - manifests-apps
+      - manifests-ingress
+    run: |
+      echo "manifests/ contents:"
+      ls -1 "${manifests_dir}/" | sed 's/^/  /'
+
+  manifests-clean:
+    doc: Wipe ${manifests_dir}.
+    run: |
+      rm -rf "${manifests_dir}"
+      echo "wiped ${manifests_dir}/"
+
+  # =====================================================================
+  # Section 5: OCI bundle pack & push
+  # =====================================================================
+
+  bundle-render-install:
+    doc: Render install.sh into the bundle staging dir.
+    run: |
+      mkdir -p "${bundle_staging}"
+      cat > "${bundle_staging}/install.sh" <<INSTALL
+      ${render:install-script(namespace=namespace, project=project, version=version)}
+      INSTALL
+      chmod +x "${bundle_staging}/install.sh"
+      echo "wrote ${bundle_staging}/install.sh"
+
+  bundle-stage:
+    doc: |
+      Assemble the bundle staging dir: manifests + CA cert (public
+      only — NOT the private key) + install.sh.
+    deps: [manifests-all, pki-all, bundle-render-install]
+    run: |
+      set -e
+      mkdir -p "${bundle_staging}/manifests" "${bundle_staging}/pki"
+      cp -R "${manifests_dir}/." "${bundle_staging}/manifests/"
+      cp "${pki_dir}/ca.crt"     "${bundle_staging}/pki/ca.crt"
+      cp "${pki_dir}/server.crt" "${bundle_staging}/pki/server.crt"
+
+      echo "bundle staging at ${bundle_staging}/:"
+      find "${bundle_staging}" -maxdepth 3 -type f | sed 's/^/  /'
+
+  bundle-create:
+    doc: Tar the staging dir into ${out_dir}/bundle.tar.gz.
+    deps: [bundle-stage]
+    run: |
+      set -e
+      mkdir -p "${out_dir}"
+      tar -czf "${out_dir}/bundle.tar.gz" \
+        -C "${bundle_staging}" \
+        manifests pki install.sh
+      bytes=$(stat -c %s "${out_dir}/bundle.tar.gz" 2>/dev/null || stat -f %z "${out_dir}/bundle.tar.gz")
+      echo "created ${out_dir}/bundle.tar.gz (${bytes} bytes)"
+
+  bundle-push:
+    doc: Push the bundle to Zot as an OCI artifact via oras.
+    deps: [bundle-create, registry-ensure]
+    run: |
+      set -e
+      bundle_ref="${registry}/${project}/bundle:${version}"
+
+      oras push --plain-http "$bundle_ref" \
+        --annotation "org.opencontainers.image.title=${project} deploy bundle" \
+        --annotation "org.opencontainers.image.version=${version}" \
+        --annotation "org.opencontainers.image.description=Manifests + CA cert + install.sh for ${project}" \
+        "${out_dir}/bundle.tar.gz:application/vnd.gmk.bundle.v1.tar+gzip"
+
+      echo "pushed: $bundle_ref"
+
+  bundle-inspect:
+    doc: Show the bundle's OCI manifest + annotations.
+    run: |
+      bundle_ref="${registry}/${project}/bundle:${version}"
+      oras manifest fetch --plain-http --pretty "$bundle_ref"
+
+  # =====================================================================
+  # Section 6: Production-side deploy
+  # =====================================================================
+
+  deploy-pull:
+    doc: Pull the bundle artifact from Zot.
+    run: |
+      set -e
+      mkdir -p "${deploy_staging}"
+      bundle_ref="${registry}/${project}/bundle:${version}"
+      oras pull --plain-http -o "${deploy_staging}/oras-pulled" "$bundle_ref"
+      mv "${deploy_staging}/oras-pulled/bundle.tar.gz" "${deploy_staging}/bundle.tar.gz"
+      rm -rf "${deploy_staging}/oras-pulled"
+      echo "pulled ${deploy_staging}/bundle.tar.gz"
+
+  deploy-unpack:
+    doc: Extract the bundle tarball.
+    deps: [deploy-pull]
+    run: |
+      set -e
+      mkdir -p "${deploy_staging}/extracted"
+      tar -xzf "${deploy_staging}/bundle.tar.gz" -C "${deploy_staging}/extracted"
+      echo "extracted to ${deploy_staging}/extracted/:"
+      find "${deploy_staging}/extracted" -maxdepth 3 | sed 's/^/  /'
+
+  deploy-apply:
+    doc: kubectl apply the unpacked manifests against the current context.
+    deps: [deploy-unpack]
+    run: |
+      set -e
+      manifests="${deploy_staging}/extracted/manifests"
+      if [ ! -d "$manifests" ]; then
+        echo "FATAL: $manifests not found" >&2
+        exit 1
+      fi
+      kubectl apply -f "$manifests"
+      echo "applied manifests from $manifests"
+
+  deploy-status:
+    doc: kubectl get pods/svc/ingress for the deployed namespace.
+    run: |
+      echo "=== pods ==="
+      kubectl -n "${namespace}" get pods
+      echo
+      echo "=== services ==="
+      kubectl -n "${namespace}" get svc
+      echo
+      echo "=== ingress ==="
+      kubectl -n "${namespace}" get ingress
+
+  deploy-delete:
+    doc: Remove the entire namespace. Destructive.
+    run: |
+      echo "About to delete namespace ${namespace} — Ctrl-C to abort."
+      sleep 3
+      kubectl delete namespace "${namespace}"
+
+  # =====================================================================
+  # Aggregate / top-level targets
+  # =====================================================================
+
+  setup:
+    doc: PKI + registry. Run once before build.
+    deps: [pki-all, registry-ensure]
+    run: |
+      echo "setup complete"
+
+  build:
+    doc: Build & push both images.
+    deps: [images-all]
+    run: |
+      echo "build complete"
+
+  manifests:
+    doc: Generate all k8s manifests.
+    deps: [manifests-all]
+    run: |
+      echo "manifests generated"
+
+  bundle:
+    doc: Bundle and push to Zot.
+    deps: [bundle-push]
+    run: |
+      echo "bundle pushed: ${registry}/${project}/bundle:${version}"
+
+  deploy:
+    doc: Pull the bundle and apply to k3s.
+    deps: [deploy-apply]
+    run: |
+      sleep 2
+      kubectl -n "${namespace}" get pods
+
+  all:
+    doc: End-to-end pipeline.
+    deps: [setup, build, manifests, bundle, deploy]
+    run: |
+      echo "fullstack-app: complete"
+
+  clean:
+    doc: Wipe .gmk-cache/out and .gmk-cache/deploy. Does not touch registry or k3s.
+    run: |
+      rm -rf "${out_dir}" "${deploy_staging}"
+      echo "cleaned local artifacts"

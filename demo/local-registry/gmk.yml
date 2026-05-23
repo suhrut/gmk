@@ -1,0 +1,76 @@
+# Local Zot OCI registry — lifecycle targets.
+#
+# Boots a single docker container running Zot. Exposes the registry
+# at localhost:5000 (configurable below). The persistent volume keeps
+# pushed images alive across container restarts.
+
+vars:
+  zot_container: "gmk-zot-demo"
+  zot_image:     "ghcr.io/project-zot/zot-linux-amd64:latest"
+  zot_port:      "5000"
+  zot_volume:    "gmk-zot-data"
+
+targets:
+  start:
+    doc: Boot Zot in the background. No-op if already running.
+    run: |
+      if docker ps --format '{{.Names}}' | grep -q "^${zot_container}$"; then
+        echo "already running: ${zot_container}"
+        exit 0
+      fi
+      # Remove a stopped-but-not-gone container first.
+      docker rm -f "${zot_container}" 2>/dev/null || true
+
+      docker run -d \
+        --name "${zot_container}" \
+        --restart unless-stopped \
+        -p "${zot_port}:5000" \
+        -v "${zot_volume}:/var/lib/registry" \
+        "${zot_image}"
+
+      # Wait briefly until the API is responsive.
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        if curl -fsS "http://localhost:${zot_port}/v2/" >/dev/null 2>&1; then
+          echo "zot ready on localhost:${zot_port}"
+          exit 0
+        fi
+        sleep 1
+      done
+      echo "zot did not become ready in 10s" >&2
+      docker logs "${zot_container}" >&2
+      exit 1
+
+  stop:
+    doc: Stop and remove the Zot container. Volume is preserved.
+    run: |
+      docker rm -f "${zot_container}" 2>/dev/null && \
+        echo "stopped ${zot_container}" || \
+        echo "${zot_container} was not running"
+
+  status:
+    doc: Show running state and a registry catalog snapshot.
+    run: |
+      if ! docker ps --format '{{.Names}}' | grep -q "^${zot_container}$"; then
+        echo "stopped"
+        exit 0
+      fi
+      echo "container: $(docker ps --format '{{.Names}} ({{.Status}})' --filter name=^${zot_container}$)"
+      echo "url:       http://localhost:${zot_port}"
+      echo
+      echo "repositories:"
+      curl -fsS "http://localhost:${zot_port}/v2/_catalog" 2>/dev/null | \
+        python3 -m json.tool 2>/dev/null || echo "  (registry not responding yet)"
+
+  logs:
+    doc: Tail the Zot container logs. Use Ctrl-C to detach.
+    run: |
+      docker logs -f "${zot_container}"
+
+  reset:
+    doc: |
+      Destroy the container AND the data volume. Use this when you
+      want a fresh registry with no pushed images.
+    run: |
+      docker rm -f "${zot_container}" 2>/dev/null || true
+      docker volume rm "${zot_volume}" 2>/dev/null || true
+      echo "registry destroyed; next 'start' will create fresh"
