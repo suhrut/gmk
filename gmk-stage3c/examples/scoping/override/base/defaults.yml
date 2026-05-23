@@ -1,8 +1,0 @@
-# examples/scoping/override/base/defaults.yml
-#
-# A library of default values. Other files include this and override
-# selectively.
-
-vars:
-  mode: "production"     # default; can be overridden
-  base_only: "untouched" # not overridden — flows through

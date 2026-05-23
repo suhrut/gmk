@@ -24,7 +24,9 @@ import (
 
 	"github.com/suhrut/gmk/internal/cache"
 	"github.com/suhrut/gmk/internal/ir"
+	"github.com/suhrut/gmk/internal/render"
 	"github.com/suhrut/gmk/internal/resolve"
+	"github.com/suhrut/gmk/internal/template"
 )
 
 // ErrTargetNil signals a programming error: WriteScript was called with
@@ -57,7 +59,13 @@ func WriteScript(t *ir.Target, p *ir.Project) (string, error) {
 		return "", ErrTargetNil
 	}
 
-	body, err := resolve.ResolveString(t.Run, p)
+	// Stage 3c: build a render dispatcher so target bodies containing
+	// ${render:name(args)} are expanded before the script is written.
+	// Without this, the legacy WriteScript path would fail with
+	// "no render resolver configured" — leaving WriteScript out of sync
+	// with the unified call/run flow in cli/run.go.
+	renderDisp := render.New(p.Templates, template.Default)
+	body, err := resolve.ResolveStringInScopeWithRender(t.Run, p.RootScope, renderDisp)
 	if err != nil {
 		return "", fmt.Errorf("materialize %s: resolve script body: %w", t.Name, err)
 	}

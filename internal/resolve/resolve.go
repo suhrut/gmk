@@ -92,9 +92,25 @@ func ResolveInScope(name string, sc *ir.Scope) (string, error) {
 // Resolution recurses through scope.Lookup: if a var's value contains a
 // ${other} ref, that ref is resolved against the same scope, with cycle
 // detection.
+//
+// This entry point does not enable ${render:name(args)} — any render
+// reference will fail with "no render resolver configured". Callers
+// that need rendering pass a configured RenderResolver via
+// ResolveStringInScopeWithRender.
 func ResolveStringInScope(s string, sc *ir.Scope) (string, error) {
+	return ResolveStringInScopeWithRender(s, sc, nil)
+}
+
+// ResolveStringInScopeWithRender is the rendering-aware variant of
+// ResolveStringInScope. Used by the CLI's run/dryrun paths where target
+// bodies may contain ${render:name(args)} that should expand at body-
+// interpolation time (before the shell ever sees the script).
+//
+// Passing nil for renders is equivalent to ResolveStringInScope and
+// makes ${render:...} a runtime error.
+func ResolveStringInScopeWithRender(s string, sc *ir.Scope, renders expr.RenderResolver) (string, error) {
 	if sc == nil {
-		return "", fmt.Errorf("ResolveStringInScope: nil scope")
+		return "", fmt.Errorf("ResolveStringInScopeWithRender: nil scope")
 	}
 	node, err := expr.ParseTemplate(s, expr.Position{})
 	if err != nil {
@@ -102,6 +118,7 @@ func ResolveStringInScope(s string, sc *ir.Scope) (string, error) {
 	}
 	resolver := newScopeResolver(sc)
 	e := newEvaluator(resolver)
+	e.Renders = renders
 	return e.EvalToString(node)
 }
 

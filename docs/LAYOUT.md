@@ -175,3 +175,78 @@ into general-purpose polyglot task running, and follows the
 tool-name-matches-manifest-name convention used by every modern
 project tool. There is no fallback to `build.yml`; rename existing
 files and update any tooling that referred to them.
+
+## Templates (Stage 3c)
+
+A gmk project may declare reusable text-rendering templates under
+the top-level `templates:` block. Each template carries a body or
+file reference, optional engine, and optional doc string:
+
+```yaml
+templates:
+  # Inline template — short snippets where the body is clearer next
+  # to the declaration.
+  license-header:
+    engine: jinja
+    body: |
+      // Copyright {{ year }} {{ owner }}
+      // SPDX-License-Identifier: Apache-2.0
+
+  # File-reference template — real templates that benefit from editor
+  # syntax highlighting and can grow without stretching the YAML.
+  dockerfile:
+    engine: jinja
+    file: templates/dockerfile.tmpl
+    doc: Renders an application Dockerfile from build args.
+```
+
+File paths are resolved relative to the YAML that declared the
+template. A template included from a library YAML looks for its
+file in the library's directory, not the consumer's project root —
+this keeps shared template libraries self-contained.
+
+Targets and functions invoke a template via the `${render:name(args)}`
+expression operator:
+
+```yaml
+functions:
+  emit-dockerfile:
+    params:
+      - {name: image,   type: string}
+      - {name: version, type: string}
+    prelude:
+      content: "${render:dockerfile(image=image, version=version)}"
+    run: |
+      echo "$content" > Dockerfile
+```
+
+The render runs during prelude evaluation; the body receives the
+rendered string as a normal prelude var. The body never directly
+calls a template — all rendering is expression-level work that
+happens before the script runs.
+
+### Template engines
+
+Two engines ship by default:
+
+| Name      | Source                                      | When to use                                     |
+|-----------|---------------------------------------------|-------------------------------------------------|
+| `jinja`   | Pure-Go port of Jinja2 (gonja v2)           | Default. Familiar from Ansible/Helm/Salt; rich logic (filters, inheritance, macros, custom filters/tests). |
+| `go`      | Stdlib `text/template`                      | Zero new deps; minimal-deps builds; users who prefer Go syntax. |
+
+Per-template `engine:` overrides the default. Omit it to use the
+project's registry default (set at startup to `jinja`).
+
+Stage 3f plugins will add the ability to register additional engines
+without touching the gmk binary. The same `template.Engine` interface
+applies to plugin-provided engines.
+
+### Build tag for minimal builds
+
+The jinja engine pulls in gonja v2 and its transitive deps. To build
+gmk without the jinja engine (and without those deps), pass
+`-tags nogonja` to `go build`. The resulting binary still recognizes
+the `go` engine; templates declared with `engine: jinja` (or omitted
+when the default is jinja) fail with a clear error pointing at the
+build tag. This is rarely needed in practice but useful for
+constrained environments.

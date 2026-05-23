@@ -12,9 +12,11 @@ import (
 	"github.com/suhrut/gmk/internal/dag"
 	"github.com/suhrut/gmk/internal/ir"
 	"github.com/suhrut/gmk/internal/materialize"
+	"github.com/suhrut/gmk/internal/render"
 	"github.com/suhrut/gmk/internal/resolve"
 	"github.com/suhrut/gmk/internal/runner"
 	"github.com/suhrut/gmk/internal/store"
+	"github.com/suhrut/gmk/internal/template"
 )
 
 // newRunCmd returns the `gmk run <target>` command.
@@ -142,7 +144,13 @@ func runOneTarget(ctx context.Context, out io.Writer, project *ir.Project, t *ir
 	// This is the one place where target run differs from function
 	// call: targets historically had body interpolation, functions
 	// don't (they use $GMK_ARGS instead).
-	resolvedRun, err := resolve.ResolveStringInScope(t.Run, project.RootScope)
+	//
+	// Stage 3c: we pass a render dispatcher so target bodies that use
+	// ${render:name(args)} expand the rendered output into the script
+	// before materialization. Without this the render: would fail at
+	// resolution time with "no render resolver configured".
+	renderDisp := render.New(project.Templates, template.Default)
+	resolvedRun, err := resolve.ResolveStringInScopeWithRender(t.Run, project.RootScope, renderDisp)
 	if err != nil {
 		return fmt.Errorf("target %q: body resolution: %w", t.Name, err)
 	}

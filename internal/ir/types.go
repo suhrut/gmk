@@ -74,6 +74,19 @@ type Project struct {
 	// options.
 	Languages map[string]*Language
 
+	// Templates maps a template name to its definition. Stage 3c: templates
+	// are reusable text-rendering patterns invoked from expressions via
+	// ${render:name(args)}. They sit alongside functions and targets but
+	// carry no executable code of their own — the underlying engine
+	// (jinja by default, go for stdlib text/template) handles rendering.
+	// Template lookup is project-wide and follows the same uniqueness
+	// rules as functions/targets.
+	Templates map[string]*Template
+
+	// TemplateOrder preserves declaration order from YAML, for deterministic
+	// listing in `gmk list --templates` and `gmk doc` output.
+	TemplateOrder []string
+
 	// Reserved for later stages:
 	//
 	//   Hash string  // S6: sha256 of normalized IR, for cache key
@@ -459,4 +472,58 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(buf[i:])
+}
+
+// Template is a reusable text-rendering pattern (Stage 3c). One
+// template plus one or more invocations replaces the "five almost-
+// identical Dockerfiles" problem with one source of truth.
+//
+// Exactly one of Body or File is non-empty (load enforces). Inline
+// Body is convenient for short snippets (license headers, one-line
+// configs); File is the right choice for real templates that benefit
+// from syntax highlighting in an editor and can grow without
+// stretching the YAML.
+//
+// Engine names the registered template engine handling render
+// ("jinja" for gonja-v2-backed Jinja2, "go" for stdlib text/template,
+// or any engine added via Stage 3f plugins). Empty means "use the
+// registry's default" — set at startup in cmd/gmk/main.go, currently
+// "jinja".
+//
+// Params is intentionally omitted in Stage 3c: templates take whatever
+// args ${render:name(args)} passes them and the engine handles missing-
+// key behavior. Adding declared params (with types and defaults, like
+// functions) would buy validation but doubles the surface area and the
+// engines themselves already produce clear "undefined variable" errors.
+// Revisit if real-world use shows users want load-time validation.
+type Template struct {
+	// Name is the template's identifier (used in ${render:name(...)}).
+	Name string
+
+	// Source is the file:line:column of the declaration, for error
+	// messages and `gmk doc` output.
+	Source SourceLoc
+
+	// Body is the inline template source as written in YAML. Empty
+	// when File is set.
+	Body string
+
+	// File is the path to the template source file, relative to the
+	// YAML file that declared this template. Empty when Body is set.
+	// Resolved to an absolute path at load time and stored in
+	// ResolvedFile; File preserves the original spelling for doc/error
+	// output.
+	File string
+
+	// ResolvedFile is the absolute path to the template file after
+	// the relative-to-declaring-YAML resolution. Empty for inline
+	// templates. The engine receives the file contents, not the path.
+	ResolvedFile string
+
+	// Engine names the template engine to use. Empty means use the
+	// registry's default at render time.
+	Engine string
+
+	// Doc is the user-supplied doc string, surfaced by `gmk doc`.
+	Doc string
 }

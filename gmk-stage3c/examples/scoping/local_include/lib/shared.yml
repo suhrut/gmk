@@ -1,6 +1,0 @@
-# examples/scoping/local_include/lib/shared.yml
-#
-# A shared library file. Provides shared_var to anyone who includes it.
-
-vars:
-  shared_var: "from-shared-lib"

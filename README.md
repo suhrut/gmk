@@ -44,8 +44,11 @@ just) each cover only part of the workflow.
 A gmk project has a single `gmk.yml` at its root. Every `gmk` command
 finds it by walking up from the current directory. Split files for
 larger projects live in `gmk/*.yml` and are included from the
-top-level file. See [docs/LAYOUT.md](docs/LAYOUT.md) for the full
-convention and discovery rules.
+top-level file. Reusable text-rendering templates (Stage 3c) live in
+a top-level `templates:` block and are invoked from expressions via
+`${render:name(args)}` — useful for Dockerfiles, k8s manifests,
+nginx configs, and generated source. See [docs/LAYOUT.md](docs/LAYOUT.md)
+for the full convention and discovery rules.
 
 ## Design
 

@@ -20,3 +20,4 @@ dist/
 # Local-only configs
 *.local.yml
 .envrc
+gmk-stage*

@@ -1,0 +1,36 @@
+# Stage 3c example: rendering Dockerfiles from a template.
+#
+# A target's prelude renders the template with bound args; the body
+# writes the result to a file. The function/target is the deciding
+# logic ("which version, what entrypoint"); the template is the
+# rendering ("how a Dockerfile is shaped").
+#
+# Run with:
+#   gmk run emit-dockerfile-go
+#   gmk run emit-dockerfile-python
+# Each produces a Dockerfile in /tmp via the body.
+
+templates:
+  app-dockerfile:
+    engine: go
+    file: templates/dockerfile.tmpl
+    doc: |
+      Renders a basic application Dockerfile.
+      Args: base_image, version, entrypoint, build_cmd (optional).
+
+targets:
+  emit-dockerfile-go:
+    run: |
+      cat > /tmp/Dockerfile.go << 'DOCKERFILE'
+      ${render:app-dockerfile(base_image="golang", version="1.22", entrypoint="/usr/local/bin/myapp", build_cmd="go build -o /usr/local/bin/myapp ./cmd/myapp")}
+      DOCKERFILE
+      echo "Wrote /tmp/Dockerfile.go:"
+      cat /tmp/Dockerfile.go
+
+  emit-dockerfile-python:
+    run: |
+      cat > /tmp/Dockerfile.python << 'DOCKERFILE'
+      ${render:app-dockerfile(base_image="python", version="3.12-slim", entrypoint="python", build_cmd="pip install -r requirements.txt")}
+      DOCKERFILE
+      echo "Wrote /tmp/Dockerfile.python:"
+      cat /tmp/Dockerfile.python

@@ -1,0 +1,10 @@
+{{- /* Stage 3c template example: a tiny dockerfile renderer.
+       Engine is 'go' (text/template) so this example runs in any
+       gmk build, including -tags nogonja minimal builds. The
+       jinja-engine equivalent is in ../jinja-dockerfile/. */ -}}
+FROM {{.base_image}}:{{.version}}
+WORKDIR /app
+COPY . .
+{{if .build_cmd}}RUN {{.build_cmd}}
+{{end -}}
+ENTRYPOINT ["{{.entrypoint}}"]

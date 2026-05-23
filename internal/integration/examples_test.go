@@ -33,8 +33,10 @@ import (
 	"github.com/suhrut/gmk/internal/ir"
 	"github.com/suhrut/gmk/internal/load"
 	"github.com/suhrut/gmk/internal/materialize"
+	"github.com/suhrut/gmk/internal/render"
 	"github.com/suhrut/gmk/internal/resolve"
 	"github.com/suhrut/gmk/internal/runner"
+	"github.com/suhrut/gmk/internal/template"
 )
 
 // examplesRoot returns the absolute path to the examples/ directory.
@@ -145,6 +147,8 @@ func TestExamplesResolveAllVars(t *testing.T) {
 //   - every dep references a target that exists in the project
 //   - every env: value resolves
 //   - every cwd value resolves
+//   - every Run script resolves as a template (including any ${render:...}
+//     references — Stage 3c added this expansion path)
 func TestExamplesTargetsConsistent(t *testing.T) {
 	setExampleEnv(t)
 	root := examplesRoot(t)
@@ -158,6 +162,11 @@ func TestExamplesTargetsConsistent(t *testing.T) {
 			if err != nil {
 				t.Fatalf("load: %v", err)
 			}
+			// Stage 3c: examples may use ${render:tmpl(args)} in their
+			// target bodies. Build a render dispatcher from the project's
+			// templates so resolution doesn't fail with "no render
+			// resolver configured" for legitimate template usage.
+			renderDisp := render.New(p.Templates, template.Default)
 			for tname, tgt := range p.Targets {
 				// Deps must resolve to real targets.
 				for _, dep := range tgt.Deps {
@@ -167,19 +176,20 @@ func TestExamplesTargetsConsistent(t *testing.T) {
 				}
 				// Env values must resolve as templates.
 				for k, v := range tgt.Env {
-					if _, err := resolve.ResolveString(v, p); err != nil {
+					if _, err := resolve.ResolveStringInScopeWithRender(v, p.RootScope, renderDisp); err != nil {
 						t.Errorf("target %q env[%s]: %v", tname, k, err)
 					}
 				}
 				// Cwd must resolve.
 				if tgt.Cwd != "" {
-					if _, err := resolve.ResolveString(tgt.Cwd, p); err != nil {
+					if _, err := resolve.ResolveStringInScopeWithRender(tgt.Cwd, p.RootScope, renderDisp); err != nil {
 						t.Errorf("target %q cwd: %v", tname, err)
 					}
 				}
-				// Run script must resolve as a template.
+				// Run script must resolve as a template, including any
+				// ${render:...} expansions.
 				if tgt.Run != "" {
-					if _, err := resolve.ResolveString(tgt.Run, p); err != nil {
+					if _, err := resolve.ResolveStringInScopeWithRender(tgt.Run, p.RootScope, renderDisp); err != nil {
 						t.Errorf("target %q run: %v", tname, err)
 					}
 				}

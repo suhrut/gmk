@@ -18,6 +18,23 @@ type CallResolver interface {
 	ResolveCall(name string, args map[string]Value) (Value, error)
 }
 
+// RenderResolver dispatches `render:` NamedCalls to the project's
+// template machinery. Like CallResolver, implemented outside expr so
+// the expression layer stays clean of project-shape knowledge.
+//
+// ResolveRender is invoked with the template name (already reduced
+// from any expression-form name like dockerfile-${lang}) and a map of
+// evaluated argument values. The returned Value is always a String
+// (the rendered output); engines that fail produce an error.
+//
+// Stage 3c: ResolveRender exists to satisfy the same separation-of-
+// concerns wall that CallResolver does. The implementation lives in
+// internal/resolve and bridges to internal/template via the project's
+// ir.Template map.
+type RenderResolver interface {
+	ResolveRender(name string, args map[string]Value) (Value, error)
+}
+
 // VarResolver is what an Evaluator needs to look up bare ${name} refs.
 //
 // ResolveVar should:
@@ -37,7 +54,8 @@ type ProviderFunc func(name string) (string, bool)
 // Evaluator reduces AST nodes to Values against a scope (via VarResolver)
 // and external providers (env, ctx). Function dispatch is via Funcs;
 // `call:` NamedCalls dispatch via Calls (may be nil — in that case
-// NamedCalls fail with a clear error).
+// NamedCalls fail with a clear error). `render:` NamedCalls dispatch
+// via Renders (may be nil — same fail-clear behavior).
 //
 // An Evaluator is single-use per resolution (the underlying VarResolver
 // implementation tracks its own cycle state). Reusing across unrelated
@@ -46,8 +64,9 @@ type Evaluator struct {
 	Vars        VarResolver
 	EnvProvider ProviderFunc
 	CtxProvider ProviderFunc
-	Funcs       *FuncRegistry // nil -> uses DefaultFuncs()
-	Calls       CallResolver  // Stage 3b: nil disables ${call:...}
+	Funcs       *FuncRegistry  // nil -> uses DefaultFuncs()
+	Calls       CallResolver   // Stage 3b: nil disables ${call:...}
+	Renders     RenderResolver // Stage 3c: nil disables ${render:...}
 }
 
 // Eval reduces a node to a Value.
@@ -301,12 +320,14 @@ func (e *Evaluator) evalConcat(c *Concat) (Value, error) {
 	return NewString(out), nil
 }
 
-// evalNamedCall dispatches a NamedCall to the Calls resolver. Arguments
-// are evaluated left-to-right; positional args go into the map under
-// stringified indices ("0", "1", ...), named args under their names.
+// evalNamedCall dispatches a NamedCall to the appropriate resolver
+// based on Kind. Arguments are evaluated left-to-right; positional
+// args go into the map under stringified indices ("0", "1", ...),
+// named args under their names.
 //
-// The kind must be "call" — other kinds will be rejected with a clear
-// error so future extensions (template:, secret:) fail predictably
+// Stage 3c: two kinds are recognised — "call" (Stage 3b, dispatches to
+// CallResolver) and "render" (Stage 3c, dispatches to RenderResolver).
+// Future kinds (e.g. "secret:") fail predictably with a clear error
 // until they're implemented.
 //
 // Why a map and not an ordered list: receivers care about names; the
@@ -314,14 +335,8 @@ func (e *Evaluator) evalConcat(c *Concat) (Value, error) {
 // This avoids inventing a tagged-arg list type, and the JSON
 // boundary contract for the eventual gmk call CLI uses a map too.
 func (e *Evaluator) evalNamedCall(n *NamedCall) (Value, error) {
-	if n.Kind != "call" {
-		return NewNone(), NewEvalError(n.P, nil,
-			"unsupported call kind %q (only \"call\" is recognised in this stage)", n.Kind)
-	}
-	if e.Calls == nil {
-		return NewNone(), NewEvalError(n.P, nil,
-			"no call resolver configured; cannot evaluate ${call:%s(...)}", n.Name)
-	}
+	// Argument evaluation is identical across kinds, so do it once
+	// up-front before dispatching.
 	args := make(map[string]Value, len(n.Args))
 	posIdx := 0
 	for _, a := range n.Args {
@@ -336,11 +351,34 @@ func (e *Evaluator) evalNamedCall(n *NamedCall) (Value, error) {
 			args[a.Name] = v
 		}
 	}
-	out, err := e.Calls.ResolveCall(n.Name, args)
-	if err != nil {
-		return NewNone(), NewEvalError(n.P, err, "call:%s", n.Name)
+
+	switch n.Kind {
+	case "call":
+		if e.Calls == nil {
+			return NewNone(), NewEvalError(n.P, nil,
+				"no call resolver configured; cannot evaluate ${call:%s(...)}", n.Name)
+		}
+		out, err := e.Calls.ResolveCall(n.Name, args)
+		if err != nil {
+			return NewNone(), NewEvalError(n.P, err, "call:%s", n.Name)
+		}
+		return out, nil
+
+	case "render":
+		if e.Renders == nil {
+			return NewNone(), NewEvalError(n.P, nil,
+				"no render resolver configured; cannot evaluate ${render:%s(...)}", n.Name)
+		}
+		out, err := e.Renders.ResolveRender(n.Name, args)
+		if err != nil {
+			return NewNone(), NewEvalError(n.P, err, "render:%s", n.Name)
+		}
+		return out, nil
+
+	default:
+		return NewNone(), NewEvalError(n.P, nil,
+			"unsupported call kind %q (recognised: call, render)", n.Kind)
 	}
-	return out, nil
 }
 
 // itoa is a tiny strconv-free int-to-string helper for the positional

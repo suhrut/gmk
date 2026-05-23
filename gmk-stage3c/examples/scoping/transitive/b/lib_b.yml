@@ -1,6 +1,0 @@
-# examples/scoping/transitive/b/lib_b.yml
-#
-# Level 2 (deepest) include. Provides var_b.
-
-vars:
-  var_b: "from-b"

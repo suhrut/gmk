@@ -36,9 +36,11 @@ import (
 	"github.com/suhrut/gmk/internal/funcs"
 	"github.com/suhrut/gmk/internal/ir"
 	"github.com/suhrut/gmk/internal/materialize"
+	"github.com/suhrut/gmk/internal/render"
 	"github.com/suhrut/gmk/internal/resolve"
 	"github.com/suhrut/gmk/internal/runner"
 	"github.com/suhrut/gmk/internal/store"
+	"github.com/suhrut/gmk/internal/template"
 )
 
 func newCallCmd() *cobra.Command {
@@ -276,6 +278,14 @@ func runCallOnce(p *ir.Project, fn *ir.Function, tgt *ir.Target, args map[string
 	}
 	defer st.Close()
 
+	// Stage 3c: build the render dispatcher once per invocation. It
+	// reads from the project's Templates map and uses the package-wide
+	// template.Default registry (where engines have self-registered via
+	// init). One dispatcher across the whole call tree means the
+	// per-template file cache is shared across nested ${call:...} that
+	// also render.
+	renderDisp := render.New(p.Templates, template.Default)
+
 	// Build a Runner closure that the dispatcher calls when expression
 	// evaluation hits a ${call:...}. This is the same path the top-level
 	// call uses, so nested calls work transparently.
@@ -283,7 +293,7 @@ func runCallOnce(p *ir.Project, fn *ir.Function, tgt *ir.Target, args map[string
 	doRun := func(targetFn *ir.Function, boundArgs map[string]expr.Value) (expr.Value, error) {
 		// Evaluate the function's prelude here using the dispatcher
 		// itself (so prelude can reference other call:...).
-		preludeValues, perr := evaluatePrelude(p, targetFn.Prelude, boundArgs, dispatch)
+		preludeValues, perr := evaluatePrelude(p, targetFn.Prelude, boundArgs, dispatch, renderDisp)
 		if perr != nil {
 			return expr.NewNone(), perr
 		}
@@ -375,7 +385,7 @@ func runCallOnce(p *ir.Project, fn *ir.Function, tgt *ir.Target, args map[string
 
 	// Otherwise it's a target invoked via --target. Treat it like a
 	// function with no parameters — args are still passed through.
-	preludeValues, perr := evaluatePrelude(p, tgt.Prelude, args, dispatch)
+	preludeValues, perr := evaluatePrelude(p, tgt.Prelude, args, dispatch, renderDisp)
 	if perr != nil {
 		return nil, perr
 	}
@@ -469,7 +479,7 @@ func jsonMarshalValue(v expr.Value) (string, error) {
 // entries can reference earlier ones via ${name}, since we feed
 // each evaluated binding into a local var scope before the next
 // entry's evaluation.
-func evaluatePrelude(p *ir.Project, prelude []ir.PreludeEntry, args map[string]expr.Value, calls expr.CallResolver) (map[string]expr.Value, error) {
+func evaluatePrelude(p *ir.Project, prelude []ir.PreludeEntry, args map[string]expr.Value, calls expr.CallResolver, renders expr.RenderResolver) (map[string]expr.Value, error) {
 	if len(prelude) == 0 {
 		return map[string]expr.Value{}, nil
 	}
@@ -491,6 +501,7 @@ func evaluatePrelude(p *ir.Project, prelude []ir.PreludeEntry, args map[string]e
 			EnvProvider: osEnvProvider,
 			Funcs:       expr.DefaultFuncs(),
 			Calls:       calls,
+			Renders:     renders,
 		}
 		v, err := ev.Eval(entry.Expr)
 		if err != nil {

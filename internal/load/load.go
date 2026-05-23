@@ -144,6 +144,11 @@ func loadWithChain(absPath string, chain []string) (*ir.Project, error) {
 				return nil, err
 			}
 
+		case entry.Key == "templates":
+			if err := loadTemplates(p, entry, absPath); err != nil {
+				return nil, err
+			}
+
 		default:
 			// validateTopLevelKeys should have caught this; defensive.
 			return nil, fmt.Errorf("load %s:%d:%d: unknown top-level key %q",
@@ -177,6 +182,7 @@ func emptyProject(absPath string) *ir.Project {
 		Targets:    make(map[string]*ir.Target),
 		Functions:  make(map[string]*ir.Function), // Stage 3b
 		Languages:  make(map[string]*ir.Language), // Stage 3b
+		Templates:  make(map[string]*ir.Template), // Stage 3c
 	}
 	p.RootScope = &ir.Scope{
 		Path:     "/",
@@ -463,14 +469,15 @@ func validateTopLevelKeys(topMap *yamlMap, source string) error {
 
 		switch e.Key {
 		case "includes", "targets", "vars",
-			"functions", "languages": // Stage 3b additions
+			"functions", "languages", // Stage 3b additions
+			"templates": // Stage 3c additions
 			continue
 		}
 		if isVarsBlockKey(e.Key) {
 			continue
 		}
 		return fmt.Errorf("load %s:%d:%d: unknown top-level key %q "+
-			"(accepted: includes, vars, vars_N, targets, functions, languages)",
+			"(accepted: includes, vars, vars_N, targets, functions, languages, templates)",
 			source, e.KeyLine, e.KeyCol, e.Key)
 	}
 	return nil
