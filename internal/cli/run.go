@@ -167,85 +167,90 @@ func runOneTarget(ctx context.Context, out io.Writer, project *ir.Project, t *ir
 	// dispatcher, evaluate prelude entries in declaration order.
 	renderDisp := render.New(project.Templates, template.Default)
 
+	// Stage 3c.2: always build the dispatch + doRun closure, not only
+	// when there's a prelude. Target bodies can use ${call:fn(...)},
+	// ${map:fn(items=L)}, and ${filter:fn(items=L)} which all need a
+	// CallResolver at body-resolution time. Building eagerly is cheap;
+	// the closure is just a value until something calls it.
+	var dispatch *funcs.Dispatcher
+	doRun := func(targetFn *ir.Function, boundArgs map[string]expr.Value) (expr.Value, error) {
+		fnPrelude, perr := evaluatePrelude(project, targetFn.Prelude, boundArgs, dispatch, renderDisp)
+		if perr != nil {
+			return expr.NewNone(), perr
+		}
+		// Pure-data function: prelude but no body — result is the prelude map.
+		if targetFn.Run == "" {
+			return expr.NewMap(fnPrelude), nil
+		}
+		c := materialize.CallableFromFunction(targetFn)
+		inv, merr := materialize.MaterializeCallable(c, materialize.MaterializeOpts{
+			ProjectRoot:   project.Root,
+			Store:         st,
+			Day:           day,
+			Args:          boundArgs,
+			PreludeValues: fnPrelude,
+			Languages:     project.Languages,
+			SourceFile:    targetFn.Source.File,
+		})
+		if merr != nil {
+			return expr.NewNone(), merr
+		}
+		startTime := time.Now().UTC()
+		if rerr := st.RecordStart(ctx, store.StartParams{
+			Day:          day,
+			Seq:          inv.Seq,
+			CallableName: targetFn.Name,
+			CallableKind: "function",
+			StartedAt:    startTime,
+			ArgsJSON:     jsonOrEmpty(boundArgs),
+			PreludeJSON:  jsonOrEmpty(fnPrelude),
+			SourceFile:   targetFn.Source.File,
+		}); rerr != nil {
+			return expr.NewNone(), rerr
+		}
+		res, rerr := runner.RunCallable(inv, runner.RunCallableOpts{
+			Stdout:     os.Stderr,
+			Stderr:     os.Stderr,
+			InheritEnv: true,
+		})
+		finishStatus := "ok"
+		exitCode := 0
+		if rerr != nil {
+			finishStatus = "error"
+		} else if res != nil && res.ExitCode != 0 {
+			finishStatus = "error"
+			exitCode = res.ExitCode
+		}
+		endTime := time.Now().UTC()
+		var resultJSON string
+		if res != nil {
+			if s, jerr := jsonMarshalValue(res.Value); jerr == nil {
+				resultJSON = s
+			}
+		}
+		_ = st.FinishRun(ctx, store.FinishParams{
+			Day:        day,
+			Seq:        inv.Seq,
+			FinishedAt: endTime,
+			Status:     finishStatus,
+			ExitCode:   exitCode,
+			ResultJSON: resultJSON,
+		})
+		if rerr != nil {
+			return expr.NewNone(), rerr
+		}
+		if res != nil && res.ExitCode != 0 {
+			return expr.NewNone(), fmt.Errorf("function %q body exited with code %d", targetFn.Name, res.ExitCode)
+		}
+		if res != nil {
+			return res.Value, nil
+		}
+		return expr.NewNone(), nil
+	}
+	dispatch = funcs.New(project.Functions, doRun)
+
 	var preludeValues map[string]expr.Value
 	if len(t.Prelude) > 0 {
-		var dispatch *funcs.Dispatcher
-		doRun := func(targetFn *ir.Function, boundArgs map[string]expr.Value) (expr.Value, error) {
-			fnPrelude, perr := evaluatePrelude(project, targetFn.Prelude, boundArgs, dispatch, renderDisp)
-			if perr != nil {
-				return expr.NewNone(), perr
-			}
-			// Pure-data function: prelude but no body — result is the prelude map.
-			if targetFn.Run == "" {
-				return expr.NewMap(fnPrelude), nil
-			}
-			c := materialize.CallableFromFunction(targetFn)
-			inv, merr := materialize.MaterializeCallable(c, materialize.MaterializeOpts{
-				ProjectRoot:   project.Root,
-				Store:         st,
-				Day:           day,
-				Args:          boundArgs,
-				PreludeValues: fnPrelude,
-				Languages:     project.Languages,
-				SourceFile:    targetFn.Source.File,
-			})
-			if merr != nil {
-				return expr.NewNone(), merr
-			}
-			startTime := time.Now().UTC()
-			if rerr := st.RecordStart(ctx, store.StartParams{
-				Day:          day,
-				Seq:          inv.Seq,
-				CallableName: targetFn.Name,
-				CallableKind: "function",
-				StartedAt:    startTime,
-				ArgsJSON:     jsonOrEmpty(boundArgs),
-				PreludeJSON:  jsonOrEmpty(fnPrelude),
-				SourceFile:   targetFn.Source.File,
-			}); rerr != nil {
-				return expr.NewNone(), rerr
-			}
-			res, rerr := runner.RunCallable(inv, runner.RunCallableOpts{
-				Stdout:     os.Stderr,
-				Stderr:     os.Stderr,
-				InheritEnv: true,
-			})
-			finishStatus := "ok"
-			exitCode := 0
-			if rerr != nil {
-				finishStatus = "error"
-			} else if res != nil && res.ExitCode != 0 {
-				finishStatus = "error"
-				exitCode = res.ExitCode
-			}
-			endTime := time.Now().UTC()
-			var resultJSON string
-			if res != nil {
-				if s, jerr := jsonMarshalValue(res.Value); jerr == nil {
-					resultJSON = s
-				}
-			}
-			_ = st.FinishRun(ctx, store.FinishParams{
-				Day:        day,
-				Seq:        inv.Seq,
-				FinishedAt: endTime,
-				Status:     finishStatus,
-				ExitCode:   exitCode,
-				ResultJSON: resultJSON,
-			})
-			if rerr != nil {
-				return expr.NewNone(), rerr
-			}
-			if res != nil && res.ExitCode != 0 {
-				return expr.NewNone(), fmt.Errorf("function %q body exited with code %d", targetFn.Name, res.ExitCode)
-			}
-			if res != nil {
-				return res.Value, nil
-			}
-			return expr.NewNone(), nil
-		}
-		dispatch = funcs.New(project.Functions, doRun)
-
 		var perr error
 		preludeValues, perr = evaluatePrelude(project, t.Prelude, nil, dispatch, renderDisp)
 		if perr != nil {
@@ -265,7 +270,7 @@ func runOneTarget(ctx context.Context, out io.Writer, project *ir.Project, t *ir
 			project: project,
 		}
 	}
-	resolvedRun, err := resolve.ResolveStringWithVarsAndRender(t.Run, project.RootScope, bodyVars, renderDisp)
+	resolvedRun, err := resolve.ResolveStringFull(t.Run, project.RootScope, bodyVars, dispatch, renderDisp)
 	if err != nil {
 		return fmt.Errorf("target %q: body resolution: %w", t.Name, err)
 	}

@@ -389,9 +389,81 @@ func (e *Evaluator) evalNamedCall(n *NamedCall) (Value, error) {
 		}
 		return out, nil
 
+	case "map", "filter":
+		// Stage 3c.2: iteration combinators. Both share the same arg
+		// shape — `items=L` is the iterable, every other arg is
+		// "pinned" and passed through unchanged on each element. The
+		// element binds to the named arg `item` per iteration.
+		//
+		// map:    ${map:fn(items=L, pinA=...)}    → call fn(item=X, pinA=...) per X; return List of results
+		// filter: ${filter:fn(items=L, pinA=...)} → call fn(item=X, pinA=...) per X; keep X when fn returned true
+		//
+		// The choice to make the iteration variable name fixed (`item`)
+		// rather than configurable is a deliberate restriction kept
+		// small for the initial implementation. A future stage can
+		// add `as=name` once a real use case demands it without breaking
+		// any code that uses the fixed-name convention.
+		if e.Calls == nil {
+			return NewNone(), NewEvalError(n.P, nil,
+				"no call resolver configured; cannot evaluate ${%s:%s(...)}", n.Kind, n.Name)
+		}
+		itemsVal, ok := args["items"]
+		if !ok {
+			return NewNone(), NewEvalError(n.P, nil,
+				"%s:%s: required arg `items` is missing", n.Kind, n.Name)
+		}
+		if itemsVal.Kind != ListKind {
+			return NewNone(), NewEvalError(n.P, nil,
+				"%s:%s: `items` must be a list, got %s", n.Kind, n.Name, itemsVal.Kind.String())
+		}
+		// Build the pinned-args map once. We'll add `item=X` per
+		// iteration. Shallow-copying is fine — Value is a value-type;
+		// nested maps/lists share underlying slices but we don't
+		// mutate them.
+		pinned := make(map[string]Value, len(args))
+		for k, v := range args {
+			if k == "items" {
+				continue
+			}
+			pinned[k] = v
+		}
+		// Guard the user against shadowing the iteration variable
+		// with their own `item=...` — that's almost certainly a bug.
+		if _, has := pinned["item"]; has {
+			return NewNone(), NewEvalError(n.P, nil,
+				"%s:%s: arg `item` conflicts with the per-iteration binding name (rename your pinned arg)", n.Kind, n.Name)
+		}
+		results := make([]Value, 0, len(itemsVal.List))
+		for idx, elem := range itemsVal.List {
+			callArgs := make(map[string]Value, len(pinned)+1)
+			for k, v := range pinned {
+				callArgs[k] = v
+			}
+			callArgs["item"] = elem
+			out, err := e.Calls.ResolveCall(n.Name, callArgs)
+			if err != nil {
+				return NewNone(), NewEvalError(n.P, err,
+					"%s:%s[%d]", n.Kind, n.Name, idx)
+			}
+			if n.Kind == "map" {
+				results = append(results, out)
+				continue
+			}
+			// filter: predicate must return a bool.
+			if out.Kind != BoolKind {
+				return NewNone(), NewEvalError(n.P, nil,
+					"filter:%s[%d]: predicate returned %s, expected bool",
+					n.Name, idx, out.Kind.String())
+			}
+			if out.Bool {
+				results = append(results, elem)
+			}
+		}
+		return NewList(results), nil
+
 	default:
 		return NewNone(), NewEvalError(n.P, nil,
-			"unsupported call kind %q (recognised: call, render)", n.Kind)
+			"unsupported call kind %q (recognised: call, render, map, filter)", n.Kind)
 	}
 }
 

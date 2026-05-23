@@ -1,0 +1,68 @@
+# Stage 3c.2 example #1: iteration combinators map and filter.
+#
+# What this teaches:
+#   - ${map:fn(items=L, pinned_args...)}    — call fn(item=X, pinned...) per X, return List of results
+#   - ${filter:fn(items=L, pinned_args...)} — keep X when fn(item=X) returned true
+#   - Structured vars holding lists work cleanly
+#   - Functions read GMK_ARGS (JSON) for structured args; write JSON to GMK_RESULT
+#   - join() builtin turns a List of strings into a joined string
+#   - map and filter compose: ${join(map:f(items=filter:g(items=L)), ",")}
+#
+# Try it:
+#   gmk run show-all
+#   gmk run public-only
+#   gmk run compose
+
+vars:
+  services:
+    - {name: "api",    port: 8080, public: true}
+    - {name: "worker", port: 9000, public: false}
+    - {name: "cache",  port: 6379, public: false}
+    - {name: "web",    port: 80,   public: true}
+
+functions:
+  # Format one service as "name:port". The element bound to `item` is
+  # a Map; the function reads it via GMK_ARGS (JSON).
+  format-svc:
+    lang: python
+    params:
+      - {name: item, type: map}
+    result: {type: string}
+    run: |
+      import json, os
+      args = json.load(open(os.environ["GMK_ARGS"]))
+      svc = args.get("item") or {}
+      name = svc.get("name", "?")
+      port = svc.get("port", 0)
+      json.dump(f"{name}:{port}", open(os.environ["GMK_RESULT"], "w"))
+
+  # Predicate: is the service marked public? Returns bool.
+  is-public:
+    lang: python
+    params:
+      - {name: item, type: map}
+    result: {type: bool}
+    run: |
+      import json, os
+      args = json.load(open(os.environ["GMK_ARGS"]))
+      svc = args.get("item") or {}
+      json.dump(bool(svc.get("public")), open(os.environ["GMK_RESULT"], "w"))
+
+targets:
+  # map: format every service.
+  show-all:
+    run: |
+      echo 'all services:'
+      echo '  ${join(map:format-svc(items=services), ", ")}'
+
+  # filter then map (manually): filter to public services, then format.
+  public-only:
+    run: |
+      echo 'public services:'
+      echo '  ${join(map:format-svc(items=filter:is-public(items=services)), ", ")}'
+
+  # Same composition, showing how the inner List flows out of filter
+  # straight into map's items=.
+  compose:
+    run: |
+      echo 'count of public services: ${len(filter:is-public(items=services))}'

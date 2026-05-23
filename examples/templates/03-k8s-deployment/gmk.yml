@@ -1,67 +1,52 @@
 # Stage 3c example #3: Kubernetes Deployment + Service generation
-# from structured config built in a function body.
+# from structured config.
 #
 # What this teaches:
-#   - Function bodies write JSON to $GMK_RESULT to return structured
-#     Maps. This is the natural gmk IPC story — bash/python/jq/anything
-#     can be the data source. (vars: and prelude: are scalar-only at
-#     this stage; structured shapes live in function results.)
-#   - Splat (...mapvar) to pass a function's Map result into render
+#   - Structured vars (Stage 3c.2): nested maps with lists work as
+#     first-class YAML — no more "function body returns JSON"
+#     workaround. The data lives where data should live.
+#   - Splat (...mapvar) to pass a Map of args straight into render
 #   - Jinja for-loops over .items() in YAML manifests
 #   - Conditional blocks ({% if %}) for optional sections
+#   - One template, multiple targets, different data
 #
 # Try it:
 #   gmk run emit-api-deployment
 #   gmk run emit-worker-deployment
 #   cat /tmp/api.yml /tmp/worker.yml
 
-functions:
-  # Function body writes JSON; runner reads $GMK_RESULT, parses to
-  # a Map Value, returns it as the function result. The template
-  # then consumes that Map via splat.
-  api-config:
-    result: {type: map}
-    run: |
-      cat > "$GMK_RESULT" << 'JSON'
-      {
-        "name": "api",
-        "image": "myorg/api",
-        "tag": "v2.3.1",
-        "replicas": 3,
-        "container_port": 8080,
-        "service_port": 80,
-        "labels": {
-          "tier": "backend",
-          "team": "platform"
-        },
-        "env": {
-          "LOG_LEVEL": "info",
-          "DB_HOST": "db.internal"
-        },
-        "resources": {
-          "cpu": "500m",
-          "memory": "512Mi"
-        }
-      }
-      JSON
+vars:
+  # Two service configs as plain structured YAML — what you'd
+  # naturally write. No JSON-encoding-via-function-body.
+  api_config:
+    name: "api"
+    image: "myorg/api"
+    tag: "v2.3.1"
+    replicas: 3
+    container_port: 8080
+    service_port: 80
+    labels:
+      tier: "backend"
+      team: "platform"
+    env:
+      LOG_LEVEL: "info"
+      DB_HOST: "db.internal"
+    resources:
+      cpu: "500m"
+      memory: "512Mi"
 
-  worker-config:
-    result: {type: map}
-    run: |
-      cat > "$GMK_RESULT" << 'JSON'
-      {
-        "name": "worker",
-        "image": "myorg/worker",
-        "tag": "v2.3.1",
-        "replicas": 5,
-        "container_port": 9000,
-        "service_port": 9000,
-        "labels": {
-          "tier": "background",
-          "team": "platform"
-        }
-      }
-      JSON
+  worker_config:
+    name: "worker"
+    image: "myorg/worker"
+    tag: "v2.3.1"
+    replicas: 5
+    container_port: 9000
+    service_port: 9000
+    labels:
+      tier: "background"
+      team: "platform"
+    # env and resources intentionally absent — template's {% if %}
+    # blocks omit those sections cleanly.
 
 templates:
   k8s-service:
@@ -71,19 +56,15 @@ templates:
 
 targets:
   emit-api-deployment:
-    prelude:
-      cfg: "${call:api-config()}"
     run: |
       cat > /tmp/api.yml << 'YAML'
-      ${render:k8s-service(...cfg)}
+      ${render:k8s-service(...api_config)}
       YAML
       echo "Wrote /tmp/api.yml ($(wc -l < /tmp/api.yml) lines)"
 
   emit-worker-deployment:
-    prelude:
-      cfg: "${call:worker-config()}"
     run: |
       cat > /tmp/worker.yml << 'YAML'
-      ${render:k8s-service(...cfg)}
+      ${render:k8s-service(...worker_config)}
       YAML
       echo "Wrote /tmp/worker.yml ($(wc -l < /tmp/worker.yml) lines)"

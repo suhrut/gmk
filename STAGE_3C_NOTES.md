@@ -327,3 +327,258 @@ Plus a top-level `examples/templates/README.md` indexing them.
 - **Cross-file template merging from includes** — same situation as
   before; no template imported via `includes:` becomes visible at
   the consumer's lookup. Revisit when first real-world use case lands.
+
+---
+
+## Stage 3c.2: structured vars and prelude literals
+
+**The change in one sentence:** `vars:` and function-prelude entries
+now accept nested maps and lists, not just scalar strings.
+
+### Before / after
+
+```yaml
+# Before (Stage 3c.1.2): structured shapes had to live in a function
+# that emits JSON to $GMK_RESULT.
+functions:
+  api-config:
+    result: {type: map}
+    run: |
+      cat > "$GMK_RESULT" << 'JSON'
+      {"name": "api", "image": "myorg/api", "labels": {"tier": "backend"}}
+      JSON
+targets:
+  emit:
+    prelude:
+      cfg: "${call:api-config()}"
+    run: ...
+
+# After (Stage 3c.2): the shape lives where shapes belong.
+vars:
+  api_config:
+    name: "api"
+    image: "myorg/api"
+    labels:
+      tier: "backend"
+targets:
+  emit:
+    run: ...
+```
+
+### Mechanics
+
+- **`Var.Structured expr.Value`**: new field on `*ir.Var`. Populated
+  when the YAML value is a mapping or sequence; `Var.Kind` is set to
+  the new `VarStructured`. Scalar vars keep their existing shape.
+- **`PreludeEntry.Static expr.Value`**: parallel field on prelude
+  entries. When non-zero (not NoneKind), the prelude evaluator uses
+  it verbatim instead of evaluating `Expr`.
+- **`yamlValue.ToStructuredValue(contextPath) (expr.Value, error)`**:
+  recursive YAML AST → expr.Value converter. Scalars become their
+  natural types (String/Int/Float/Bool/None), mappings become
+  MapKind, sequences become ListKind.
+- **Scope resolver**: when a lookup hits a `VarStructured` var, the
+  cached Value is returned as-is. No re-evaluation, no string
+  reparse. Index access (`${db.host}`, `${servers[0]}`,
+  `${cfg.db.host}`) goes through the existing IndexExpr evaluator.
+- **Prelude evaluator** (`evaluatePrelude` in cli/call.go): branches
+  on `Static.Kind != NoneKind` and binds the value verbatim before
+  the next entry's evaluation. Structured + scalar entries can
+  interleave; structured ones can be referenced by later scalar
+  expression entries.
+
+### Restriction (deliberate, can lift later)
+
+Leaf strings inside structured values must be **literal**. A leaf
+containing `${...}` is rejected at load time with:
+
+```
+vars.db.host: structured value leaf string contains ${...} expression,
+which is not supported yet (use a function returning JSON for
+interpolated structured data)
+```
+
+This keeps the lookup path simple (cached Value returned as-is, no
+recursive resolution walk). Once we have a concrete user wanting
+interpolated leaves we can revisit; the natural shape is lazy deep-
+walk at lookup time with cycle detection.
+
+### Tests added
+
+- `internal/load/structured_test.go` — 8 tests covering map vars,
+  list vars, deeply-nested map-with-list-of-maps, scalar+structured
+  mix in one scope, last-write-wins across vars_N blocks, structured
+  prelude entries (function), structured-then-scalar prelude ordering,
+  leaf-with-${...} rejection.
+- `internal/resolve/structured_test.go` — 7 tests covering bare
+  reference, index access (string/int/nested map/list), mixed scope,
+  missing-field error.
+- All 17 packages still green. End-to-end smoke test via actual gmk
+  binary confirms structured vars + splat + named-override +
+  dotted-path access all compose cleanly.
+
+### Examples updated
+
+`examples/templates/03-k8s-deployment`, `04-nginx-config`, and
+`05-splat-and-defaults` are now noticeably cleaner — the
+function-returns-JSON dance is gone. Example 4's `nginx-data` Python
+function disappears entirely; the data is now plain YAML.
+
+### Future hooks
+
+- Lazy interpolation in leaf strings (deferred above)
+- Structured `env:` block on targets (today it's scalar-only too —
+  same loader pattern, same shape change)
+- Structured target args once `gmk run target --arg k=v` lands —
+  same shape: each arg is either scalar or structured
+
+
+---
+
+## Stage 3c.2 follow-on: iteration combinators (map, filter)
+
+Two new expression kinds:
+
+- **`${map:fn(items=L, pinned...)}`** — call `fn(item=X, pinned...)`
+  for each element X in list L; return a List of results.
+- **`${filter:fn(items=L, pinned...)}`** — call `fn(item=X, pinned...)`
+  for each X; keep X (the original element) when fn returned true.
+  Predicate must return BoolKind; non-bool result errors loudly.
+
+### Mechanics
+
+- Implemented as new `evalNamedCall` arms (case `"map"`, case
+  `"filter"`). The parser needed zero changes — the existing
+  `kind:name(args)` shape already covers any Kind.
+- `items=` is the required arg holding the iterable. All other args
+  are "pinned" and passed unchanged on every call.
+- Element binds to the fixed name `item`. A pinned `item=` arg
+  conflicts with this and errors with a clear message (likely-bug
+  guard).
+- Iteration is sequential. `pmap:` (parallel) needs the parallel-
+  fanout primitive; deferred to its own chunk.
+
+### Wiring
+
+The target body resolution path now always builds the function
+dispatcher (not only when a prelude exists), and passes it as the
+CallResolver. New `resolve.ResolveStringFull(s, sc, vars, calls,
+renders)` is the most-general body-resolution function;
+`ResolveStringWithVarsAndRender` is now a thin wrapper.
+
+### Tests added
+
+11 unit tests in `internal/expr/iteration_test.go`:
+- map binds `item` per call in order
+- pinned args flow through unchanged
+- map over list-of-maps preserves nesting
+- empty list → empty result, no calls made
+- filter keeps original items, not bool results
+- filter rejects non-bool predicates
+- missing `items` → clear error
+- non-list `items` → clear error
+- pinned `item=` shadowing → clear error
+- no Calls resolver → clear error
+- composes with splat (`...mapvar` of pinned args)
+
+### Integration test driver tweak
+
+`bodyNeedsCallResolver(body)` helper detects bodies that need a
+dispatcher (presence of `call:`, `map:`, or `filter:` substrings).
+Used by `TestExamplesTargetsConsistent` to skip the static body-
+resolution check for those bodies — they're covered by
+`TestExamplesRun` through the production code path.
+
+### Example added
+
+`examples/iteration/01-map-filter/` demonstrates:
+- Mapping over a structured-var list of maps
+- Filtering by a predicate function
+- Composing filter inside map (`map:f(items=filter:g(items=L))`)
+- Using `len()` on a filtered List
+
+End-to-end output (real binary):
+```
+all services:
+  api:8080, worker:9000, cache:6379, web:80
+public services:
+  api:8080, web:80
+count of public services: 2
+```
+
+### Known patterns / conventions
+
+- **Functions writing JSON to `$GMK_RESULT`**: use `json.dump(value, f)`
+  from Python or `jq -n ...` from bash. The runner parses the file as
+  JSON; raw strings like `printf '%s' "$x"` produce a null Value.
+- **Reading structured args**: `args = json.load(open(os.environ["GMK_ARGS"]))`
+  is the idiom. `args["item"]` is the per-iteration element. Functions
+  meant to be discoverable by the integration test should use defensive
+  access (`args.get("item") or {}`) — the test framework stubs missing
+  args with an empty value of the declared type, and a `KeyError` on a
+  required field will fail the call test.
+
+---
+
+## Stage 3c.2: `gmk inspect <day>/<seq>`
+
+Small read-only command for inspecting a recorded run from the
+SQLite runs table. The natural debugging companion to `gmk run` and
+`gmk call`.
+
+### Usage
+
+```
+gmk inspect 20260523/0007        # explicit day/seq
+gmk inspect 0007                 # seq only, defaults to today
+gmk inspect 20260523/0007-name   # the dir-name form (trailing -<name> stripped)
+gmk inspect 7 --json             # JSON for piping into jq
+```
+
+### Output (human form)
+
+```
+Function 20260523/0001  status=ok exit=0
+  name:        format-svc
+  started:     2026-05-23 14:31:52
+  finished:    2026-05-23 14:31:52
+  duration:    21ms
+  source:      /tmp/inspect-fn/gmk.yml
+  gmk pid:     6060
+  args:
+    {
+      "item": {
+        "name": "api",
+        "port": 8080
+      }
+    }
+  result:
+    "api:8080"
+  scratch:     /tmp/inspect-fn/.gmk-cache/runs/20260523/0001-format-svc
+```
+
+Empty / null args / prelude / result columns are skipped so the
+output stays compact. The scratch dir path lets the user `cat` the
+materialized body or args/result JSON files for deeper debugging.
+
+### Files
+
+- `internal/cli/inspect.go` — command + `parseRunIdent` + human/JSON formatters
+- `internal/cli/inspect_test.go` — 7 parseRunIdent forms, 6 error
+  cases, 1 end-to-end test against a real store
+- `internal/cli/root.go` — wires `newInspectCmd()` into the command tree
+
+Uses the existing `store.GetRun(ctx, day, seq)` API; no store changes
+needed.
+
+### Future hooks
+
+- `--list-day <day>` — list all runs for a day (uses
+  `store.ListRunsForDay`, already exists)
+- `--running` — show currently-running runs (uses `store.ListRunning`)
+- `--stdout` / `--stderr` — dump captured output (needs Stage 4 log
+  capture; nothing recorded today)
+- Anchor link to the materialized body script (we know the runs dir;
+  the body lives under `.gmk-cache/bodies/<hash>/` keyed by callable
+  content hash — would need to recompute the hash or have the runner
+  record it on the row)

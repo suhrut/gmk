@@ -39,10 +39,11 @@ See https://github.com/suhrut/gmk for the spec and examples.`,
 	r.AddCommand(newVersionCmd(bi))
 	r.AddCommand(newRunCmd())
 	r.AddCommand(newDryRunCmd())
-	r.AddCommand(newCallCmd())   // Stage 3b: gmk call <function>
-	r.AddCommand(newListCmd())   // Stage 3b: gmk list
-	r.AddCommand(newDocCmd())    // Stage 3b: gmk doc <name>
-	r.AddCommand(newSchemaCmd()) // Stage 3b: gmk schema
+	r.AddCommand(newCallCmd())    // Stage 3b: gmk call <function>
+	r.AddCommand(newListCmd())    // Stage 3b: gmk list
+	r.AddCommand(newDocCmd())     // Stage 3b: gmk doc <name>
+	r.AddCommand(newSchemaCmd())  // Stage 3b: gmk schema
+	r.AddCommand(newInspectCmd()) // Stage 3c.2: gmk inspect <day>/<seq>
 
 	return r
 }

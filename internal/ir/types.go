@@ -171,9 +171,15 @@ type FunctionResult struct {
 
 // PreludeEntry is one (name, expression) pair from a function's prelude.
 // Order is preserved so later entries can reference earlier ones.
+//
+// Stage 3c.2: a prelude entry's value may be a structured Map or List
+// rather than a scalar expression. When Static is non-zero (not NoneKind),
+// it's used directly as the binding's value and Expr is nil. Scalar
+// expressions continue to populate Expr; Static stays at NoneKind.
 type PreludeEntry struct {
 	Name   string
 	Expr   expr.Node
+	Static expr.Value
 	Source SourceLoc
 }
 
@@ -315,6 +321,12 @@ const (
 	// VarTagged indicates a value produced by a YAML tag (!sh, !env, etc.).
 	// Reserved for Stage 3b; Stage 3a never produces this kind.
 	VarTagged
+
+	// VarStructured indicates a value that's a nested map or list rather
+	// than a scalar. Stage 3c.2: vars and prelude entries can carry
+	// Map/List/etc. values directly; the resolved value comes from
+	// Var.Structured rather than from Value or Expr.
+	VarStructured
 )
 
 // String returns the human-readable name of the kind, used in diagnostic
@@ -327,6 +339,8 @@ func (k VarKind) String() string {
 		return "expression"
 	case VarTagged:
 		return "tagged"
+	case VarStructured:
+		return "structured"
 	default:
 		return "unknown"
 	}
@@ -367,6 +381,13 @@ type Var struct {
 	// Stage 3b, when Kind == VarTagged and the tag produces an expression).
 	// Nil for VarLiteral.
 	Expr expr.Node
+
+	// Structured carries the resolved Value directly when Kind ==
+	// VarStructured. Stage 3c.2: a var declared as a YAML mapping or
+	// sequence is converted at load time to an expr.Value (Map or List,
+	// recursively); the scope resolver returns this verbatim instead of
+	// evaluating Value or Expr. Zero (NoneKind) for non-structured vars.
+	Structured expr.Value
 
 	// Reserved for later stages:
 	//

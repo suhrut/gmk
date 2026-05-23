@@ -203,7 +203,13 @@ func TestExamplesTargetsConsistent(t *testing.T) {
 				// using targets. TestExamplesRun exercises the actual
 				// runtime path (which evaluates the prelude before body
 				// resolution) and catches any real issue there.
-				if tgt.Run != "" && len(tgt.Prelude) == 0 {
+				//
+				// Stage 3c.2: similarly, bodies using ${call:fn(...)},
+				// ${map:fn(...)}, or ${filter:fn(...)} need a real
+				// CallResolver (the function dispatcher) which only
+				// exists at runtime. The static check has no dispatcher,
+				// so we skip these too. TestExamplesRun covers them.
+				if tgt.Run != "" && len(tgt.Prelude) == 0 && !bodyNeedsCallResolver(tgt.Run) {
 					if _, err := resolve.ResolveStringInScopeWithRender(tgt.Run, p.RootScope, renderDisp); err != nil {
 						t.Errorf("target %q run: %v", tname, err)
 					}
@@ -252,6 +258,26 @@ func relName(root, full string) string {
 		return full
 	}
 	return strings.TrimPrefix(rel, string(filepath.Separator))
+}
+
+// bodyNeedsCallResolver returns true if the body contains a substitution
+// that requires a function-dispatcher to resolve (${call:fn(...)},
+// ${map:fn(...)}, ${filter:fn(...)}, or any of those nested inside an
+// outer builtin like ${join(map:...)}). The static consistency check
+// doesn't have a dispatcher; TestExamplesRun runs these through the
+// production path.
+//
+// We detect the substring forms `call:`, `map:`, `filter:` anywhere in
+// the body. This is intentionally conservative — false positives mean
+// we skip the consistency check more often than strictly needed, which
+// is harmless (TestExamplesRun is the authoritative coverage).
+// Plain text containing these substrings is rare in practice; if it
+// becomes a real problem the next refinement is to walk the parsed
+// template AST and look for NamedCall nodes with the relevant Kind.
+func bodyNeedsCallResolver(body string) bool {
+	return strings.Contains(body, "call:") ||
+		strings.Contains(body, "map:") ||
+		strings.Contains(body, "filter:")
 }
 
 // countTopLevelVars counts vars in the project's top-level scope only

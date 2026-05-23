@@ -309,8 +309,27 @@ func loadPrelude(node yamlValue, file, contextLabel string) ([]ir.PreludeEntry, 
 		}
 		seen[kv.Key] = true
 
-		// Each value is treated as an expression template so it may
-		// contain ${...} substitutions, nested function calls, etc.
+		src := ir.SourceLoc{File: file, Line: kv.Value.Line, Column: kv.Value.Col}
+
+		// Stage 3c.2: structured prelude values are converted to
+		// expr.Value at load time and stored on PreludeEntry.Static.
+		// The evaluator returns this verbatim instead of parsing the
+		// value as a template expression.
+		if kv.Value.IsStructured() {
+			val, err := kv.Value.ToStructuredValue(contextLabel + ".prelude." + kv.Key)
+			if err != nil {
+				return nil, fmt.Errorf("load %s: %s.prelude.%s: %w",
+					file, contextLabel, kv.Key, err)
+			}
+			out = append(out, ir.PreludeEntry{
+				Name:   kv.Key,
+				Static: val,
+				Source: src,
+			})
+			continue
+		}
+
+		// Scalar value: parse as expression template.
 		raw, err := kv.Value.AsString()
 		if err != nil {
 			return nil, fmt.Errorf("load %s: %s.prelude.%s: %w", file, contextLabel, kv.Key, err)
@@ -324,7 +343,7 @@ func loadPrelude(node yamlValue, file, contextLabel string) ([]ir.PreludeEntry, 
 		out = append(out, ir.PreludeEntry{
 			Name:   kv.Key,
 			Expr:   exprNode,
-			Source: ir.SourceLoc{File: file, Line: kv.Value.Line, Column: kv.Value.Col},
+			Source: src,
 		})
 	}
 	return out, nil

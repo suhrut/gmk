@@ -496,6 +496,20 @@ func evaluatePrelude(p *ir.Project, prelude []ir.PreludeEntry, args map[string]e
 
 	out := make(map[string]expr.Value, len(prelude))
 	for _, entry := range prelude {
+		// Stage 3c.2: structured (Map/List/etc.) prelude entries
+		// carry their value verbatim — no expression to evaluate.
+		// Static.Kind != NoneKind is the discriminator. Even a
+		// declared `name: ~` (yaml null) goes through the Expr
+		// path so callers can distinguish absent from null if
+		// they ever care.
+		if entry.Static.Kind != expr.NoneKind || entry.Expr == nil {
+			// If both are zero (shouldn't happen — loader guarantees
+			// one or the other), prefer Static (which is NoneKind here,
+			// matching an empty binding cleanly).
+			layered.bound[entry.Name] = entry.Static
+			out[entry.Name] = entry.Static
+			continue
+		}
 		ev := &expr.Evaluator{
 			Vars:        layered,
 			EnvProvider: osEnvProvider,

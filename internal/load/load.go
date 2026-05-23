@@ -218,16 +218,34 @@ func loadVarsBlock(p *ir.Project, entry yamlMapEntry, file string) error {
 			return fmt.Errorf("load %s:%d:%d: %s.%s uses tag %s: %w",
 				file, kv.Value.Line, kv.Value.Col, entry.Key, kv.Key, tag, ErrTaggedValue)
 		}
-		raw, err := kv.Value.AsString()
-		if err != nil {
-			return fmt.Errorf("load %s: %s.%s: %w", file, entry.Key, kv.Key, err)
-		}
-		v, err := buildVar(kv.Key, raw, ir.SourceLoc{
-			File: file, Line: kv.Value.Line, Column: kv.Value.Col,
-		})
-		if err != nil {
-			return fmt.Errorf("load %s:%d:%d: %s.%s: %w",
-				file, kv.Value.Line, kv.Value.Col, entry.Key, kv.Key, err)
+
+		src := ir.SourceLoc{File: file, Line: kv.Value.Line, Column: kv.Value.Col}
+
+		// Stage 3c.2: structured (mapping or sequence) values are
+		// converted to expr.Value and stored on Var.Structured.
+		// Scalar values follow the original buildVar path.
+		var v *ir.Var
+		if kv.Value.IsStructured() {
+			val, err := kv.Value.ToStructuredValue(entry.Key + "." + kv.Key)
+			if err != nil {
+				return fmt.Errorf("load %s: %s.%s: %w", file, entry.Key, kv.Key, err)
+			}
+			v = &ir.Var{
+				Name:       kv.Key,
+				Source:     src,
+				Kind:       ir.VarStructured,
+				Structured: val,
+			}
+		} else {
+			raw, err := kv.Value.AsString()
+			if err != nil {
+				return fmt.Errorf("load %s: %s.%s: %w", file, entry.Key, kv.Key, err)
+			}
+			v, err = buildVar(kv.Key, raw, src)
+			if err != nil {
+				return fmt.Errorf("load %s:%d:%d: %s.%s: %w",
+					file, kv.Value.Line, kv.Value.Col, entry.Key, kv.Key, err)
+			}
 		}
 		// Last-write-wins across blocks, but maintain declaration order.
 		if _, existed := p.RootScope.Vars[kv.Key]; !existed {

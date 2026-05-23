@@ -122,6 +122,38 @@ func ResolveStringInScopeWithRender(s string, sc *ir.Scope, renders expr.RenderR
 	return e.EvalToString(node)
 }
 
+// ResolveStringFull is the most general body-resolution function:
+// callers supply optional extra var bindings (e.g. prelude scope),
+// a call resolver (for ${call:fn(...)}, ${map:fn(...)}, ${filter:...}),
+// and a render resolver (for ${render:tmpl(...)}). Any of the
+// resolvers may be nil; a missing resolver makes the corresponding
+// expression kind a runtime error.
+//
+// The earlier ResolveStringInScope, ResolveStringInScopeWithRender,
+// and ResolveStringWithVarsAndRender variants remain as thin wrappers
+// for the common cases. ResolveStringFull is what new code should
+// prefer when wiring all resolvers together (e.g. cli/run.go's
+// target body resolution).
+func ResolveStringFull(s string, sc *ir.Scope, extraVars expr.VarResolver, calls expr.CallResolver, renders expr.RenderResolver) (string, error) {
+	if sc == nil && extraVars == nil {
+		return "", fmt.Errorf("ResolveStringFull: both scope and extraVars are nil")
+	}
+	node, err := expr.ParseTemplate(s, expr.Position{})
+	if err != nil {
+		return "", err
+	}
+	var resolver expr.VarResolver
+	if extraVars != nil {
+		resolver = extraVars
+	} else {
+		resolver = newScopeResolver(sc)
+	}
+	e := newEvaluator(resolver)
+	e.Calls = calls
+	e.Renders = renders
+	return e.EvalToString(node)
+}
+
 // ResolveStringWithVarsAndRender resolves a template string with an
 // explicit VarResolver layered on top of (or replacing) a Scope. The
 // canonical Stage 3c use is body interpolation for a target whose
@@ -137,26 +169,10 @@ func ResolveStringInScopeWithRender(s string, sc *ir.Scope, renders expr.RenderR
 //   - extraVars == nil → equivalent to ResolveStringInScopeWithRender
 //     against sc.
 //
-// This is the most general form; the other two ResolveString* variants
-// are kept as convenience wrappers because they cover the common cases
-// and changing their signatures would churn many callers.
+// This is now a thin wrapper around ResolveStringFull; kept for
+// backward compatibility of existing call sites.
 func ResolveStringWithVarsAndRender(s string, sc *ir.Scope, extraVars expr.VarResolver, renders expr.RenderResolver) (string, error) {
-	if sc == nil && extraVars == nil {
-		return "", fmt.Errorf("ResolveStringWithVarsAndRender: both scope and extraVars are nil")
-	}
-	node, err := expr.ParseTemplate(s, expr.Position{})
-	if err != nil {
-		return "", err
-	}
-	var resolver expr.VarResolver
-	if extraVars != nil {
-		resolver = extraVars
-	} else {
-		resolver = newScopeResolver(sc)
-	}
-	e := newEvaluator(resolver)
-	e.Renders = renders
-	return e.EvalToString(node)
+	return ResolveStringFull(s, sc, extraVars, nil, renders)
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +225,14 @@ func (r *scopeVarResolver) ResolveVar(name string) (expr.Value, error) {
 	v, _ := scope.Lookup(r.scope, name)
 	if v == nil {
 		return expr.NewNone(), fmt.Errorf("%w: %s", ErrUndefined, name)
+	}
+
+	// Path 0 (Stage 3c.2): structured vars hold a pre-built expr.Value
+	// (Map or List) and need no further evaluation. The fast path —
+	// returns the cached value as-is. Index access (${db.host}) goes
+	// through the normal IndexExpr evaluator against this Value.
+	if v.Kind == ir.VarStructured {
+		return v.Structured, nil
 	}
 
 	// Path 1: pre-parsed AST.
