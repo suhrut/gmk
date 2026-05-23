@@ -34,7 +34,7 @@
 #
 #   gmk run setup       — PKI + registry boot
 #   gmk run build       — backend + frontend images, pushed
-#   gmk run manifests   — k8s YAML generated
+#   gmk run manifests-all   — k8s YAML generated
 #   gmk run bundle      — OCI artifact, pushed to Zot
 #   gmk run deploy      — prod-side pull + kubectl apply
 #   gmk run all         — the whole thing end-to-end
@@ -392,6 +392,7 @@ targets:
     run: |
       set -e
       mkdir -p build
+      go mod tidy
       go build -trimpath -ldflags "-s -w" -o build/server ./...
       echo "built backend/build/server"
 
@@ -452,7 +453,7 @@ targets:
     doc: Render the Namespace manifest.
     run: |
       mkdir -p "${manifests_dir}"
-      cat > "${manifests_dir}/00-namespace.yaml" <<MANIFEST
+      cat > "${manifests_dir}/00-namespace.yaml" <<'MANIFEST'
       ${render:namespace(namespace=namespace, project=project, version=version)}
       MANIFEST
       echo "wrote ${manifests_dir}/00-namespace.yaml"
@@ -461,7 +462,7 @@ targets:
     doc: Render Postgres StatefulSet + Service + PVC.
     run: |
       mkdir -p "${manifests_dir}"
-      cat > "${manifests_dir}/10-postgres.yaml" <<MANIFEST
+      cat > "${manifests_dir}/10-postgres.yaml" <<'MANIFEST'
       ${render:postgres(...postgres, namespace=namespace)}
       MANIFEST
       echo "wrote ${manifests_dir}/10-postgres.yaml"
@@ -480,7 +481,7 @@ targets:
     doc: Render the Ingress manifest.
     run: |
       mkdir -p "${manifests_dir}"
-      cat > "${manifests_dir}/90-ingress.yaml" <<MANIFEST
+      cat > "${manifests_dir}/90-ingress.yaml" <<'MANIFEST'
       ${render:ingress(...ingress, namespace=namespace, backend_name=backend.name, backend_port=backend.port, frontend_name=frontend.name, frontend_port=frontend.port)}
       MANIFEST
       echo "wrote ${manifests_dir}/90-ingress.yaml"
@@ -510,7 +511,7 @@ targets:
     doc: Render install.sh into the bundle staging dir.
     run: |
       mkdir -p "${bundle_staging}"
-      cat > "${bundle_staging}/install.sh" <<INSTALL
+      cat > "${bundle_staging}/install.sh" <<'INSTALL'
       ${render:install-script(namespace=namespace, project=project, version=version)}
       INSTALL
       chmod +x "${bundle_staging}/install.sh"
@@ -541,7 +542,7 @@ targets:
         -C "${bundle_staging}" \
         manifests pki install.sh
       bytes=$(stat -c %s "${out_dir}/bundle.tar.gz" 2>/dev/null || stat -f %z "${out_dir}/bundle.tar.gz")
-      echo "created ${out_dir}/bundle.tar.gz (${bytes} bytes)"
+      echo "created ${out_dir}/bundle.tar.gz ($bytes bytes)"
 
   bundle-push:
     doc: Push the bundle to Zot as an OCI artifact via oras.

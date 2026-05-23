@@ -798,3 +798,86 @@ notes file so the pattern is documented.
 A future stage might add a literal-escape syntax (e.g. `$${...}` or
 backtick-quoting) so bash parameter expansion can survive a target
 body. Not for this stage.
+
+### Fourth and fifth gotchas (May 23, late session)
+
+Two more issues surfaced on the user's first end-to-end run of
+`gmk run bundle`. Both are bash/gmk interaction subtleties.
+
+#### #4: unquoted heredoc terminators interpret backticks (and $var) in the body
+
+The bundle-render-install target had:
+
+```yaml
+run: |
+  cat > "${bundle_staging}/install.sh" <<INSTALL
+  ${render:install-script(...)}
+  INSTALL
+```
+
+`${render:install-script(...)}` expands at gmk-resolve time into the
+full install.sh body. install.sh contains a comment with backticks
+as markdown emphasis around `oras pull`. When the heredoc terminator
+is unquoted (`<<INSTALL`), bash performs both variable expansion AND
+command substitution on the heredoc content. So bash saw the
+backticked phrase as a command and tried to run `oras pull` with no
+args — mid-bundle-render-install. The install.sh got written
+anyway (cat continued past the error), but the output of the
+backticked region was elided.
+
+Fix: quote the terminator `<<'INSTALL'`. All four heredocs in the
+demo now use the quoted form (defensive — even YAML manifests
+shouldn't be re-expanded by bash since gmk already substituted).
+
+Verified by reproduction:
+
+  Unquoted: `oras: command not found`, backtick region stripped.
+  Quoted:   content preserved verbatim.
+
+#### #5: bash-local variables referenced with ${VAR} braces are eaten by gmk
+
+The bundle-create target had:
+
+```bash
+bytes=$(stat -c %s "${out_dir}/bundle.tar.gz" ...)
+echo "created ${out_dir}/bundle.tar.gz (${bytes} bytes)"
+```
+
+`bytes` is a bash-local variable assigned in the previous line. But
+gmk's expression interpolation runs over the whole body string
+before bash gets it, sees `${bytes}`, looks it up as a gmk var,
+doesn't find it, and errors.
+
+Fix: drop the braces — `$bytes` (no curlies). gmk's parser only
+triggers on `${...}`, so bare `$var` references survive untouched.
+
+Rule of thumb: any bash-local variable (assigned inside the target
+body) must be referenced as `$var`, never `${var}`. Gmk vars are
+the opposite — they're `${gmkvar}` and `$gmkvar` wouldn't be
+recognised by gmk.
+
+Audited the demo and confirmed every other bash-local (`tag_v`,
+`tag_l`, `san_conf`, `bundle_ref`, `pwfile`, `pw_file`) already uses
+the bare form. Only `${bytes}` was wrong.
+
+### Summary of the five gotchas (all surfaced by this demo)
+
+1. `includes:` promotes vars but not targets/functions/templates.
+2. Caller's env vars don't auto-pass into target bodies; forward
+   explicitly via `${env:NAME:-}` in the env block.
+3. Bash parameter expansion `${VAR##pat}`, `${VAR:-default}`, etc.
+   collides with gmk's `${...}` interpolation in bodies (and even
+   in YAML-block-scalar comments).
+4. Unquoted heredoc terminators (`<<X`) let bash re-interpret the
+   substituted content; quote them (`<<'X'`).
+5. Bash-local variables need `$var` not `${var}` in bodies, because
+   gmk eats the braced form.
+
+None are new in this demo — they're all consequences of how gmk's
+`${...}` interpolation overlaps with bash's `${...}`. A future
+literal-escape syntax (`$${...}` or backtick-quoting) would resolve
+#3, #4-content, and #5 in one swoop, but that's a feature, deferred.
+
+The cumulative cost so far: ~15 lines of workarounds across the
+demo. Acceptable price for a real-world validation that the rest
+of the gmk feature set models the deployment pipeline cleanly.
