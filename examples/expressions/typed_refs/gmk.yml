@@ -1,0 +1,31 @@
+# examples/expressions/typed_refs/gmk.yml
+#
+# Demonstrates: typed references inside ${...}:
+#   ${env:NAME}   - OS environment variable
+#   ${var:NAME}   - explicit form of ${NAME} (same as bare ${NAME})
+#   ${ctx:NAME}   - --ctx flag lookup (stub in 3a; wired in S4)
+#
+# The :- default modifier keeps this example stable regardless of which
+# env vars the runner has set.
+#
+# Stages exercised:    3a
+# Stages compatible:   3a, 3b+
+#
+# Run:
+#   gmk run show --file examples/expressions/typed_refs/gmk.yml
+#   USER=alice gmk run show --file examples/expressions/typed_refs/gmk.yml
+
+vars:
+  who: "bob"
+  who_env: "${env:USER:-anonymous}"
+  who_explicit: "${var:who}"
+  who_ctx: "${ctx:role:-guest}"
+
+targets:
+  show:
+    phony: true
+    run: |
+      echo "who=${who}"
+      echo "who_env=${who_env}"
+      echo "who_explicit=${who_explicit}"
+      echo "who_ctx=${who_ctx}"

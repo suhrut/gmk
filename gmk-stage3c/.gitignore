@@ -1,0 +1,22 @@
+# Build artifacts
+/gmk
+/gmk.exe
+*.test
+*.out
+coverage.txt
+coverage.html
+dist/
+
+# Editor & OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*~
+
+# gmk runtime cache (when self-hosting)
+.gmk-cache/
+
+# Local-only configs
+*.local.yml
+.envrc

@@ -1,0 +1,35 @@
+# examples/basics/multi_block_vars/gmk.yml
+#
+# Demonstrates: multiple vars blocks (vars, vars_1, vars_2). Stage 3a
+# preserves declaration order across all blocks — what's written first in
+# the file resolves first, regardless of which block it lives in.
+#
+# Block order in source determines resolution order:
+#   1. vars         (alpha, beta)
+#   2. vars_1       (gamma — can reference alpha/beta)
+#   3. vars_2       (delta — can reference all earlier)
+#
+# Stages exercised:    1, 3a (declaration order)
+# Stages compatible:   1, 2, 3a, 3b+
+#
+# Run:
+#   gmk run order --file examples/basics/multi_block_vars/gmk.yml
+
+vars:
+  alpha: "first"
+  beta: "second"
+
+vars_1:
+  gamma: "${alpha}-${beta}-third"
+
+vars_2:
+  delta: "${gamma}-fourth"
+
+targets:
+  order:
+    phony: true
+    run: |
+      echo "alpha=${alpha}"
+      echo "beta=${beta}"
+      echo "gamma=${gamma}"
+      echo "delta=${delta}"

@@ -1,0 +1,29 @@
+# examples/targets/phony/gmk.yml
+#
+# Demonstrates: phony: true marks a target as not producing a file —
+# it runs every time, no on-disk artifact check. Used for setup,
+# cleanup, status, and other side-effecting tasks.
+#
+# Most of the examples in this tree use phony: true so they remain
+# safe to run repeatedly without polluting the filesystem.
+#
+# Stages exercised:    1
+# Stages compatible:   1, 2, 3a, 3b+
+#
+# Run:
+#   gmk run status --file examples/targets/phony/gmk.yml
+
+vars:
+  service: "demo"
+
+targets:
+  status:
+    phony: true
+    run: |
+      echo "[status] service=${service} (phony — runs every time)"
+
+  ping:
+    phony: true
+    deps: [status]
+    run: |
+      echo "[ping] still alive: ${service}"

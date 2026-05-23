@@ -1,0 +1,25 @@
+# examples/basics/nested_ref/gmk.yml
+#
+# Demonstrates: deep var-to-var chaining. ${one} -> ${two} -> ${three} -> leaf.
+# Exercises the resolver's recursive walk + cycle detection (no cycle here).
+#
+# Stages exercised:    1
+# Stages compatible:   1, 2, 3a, 3b+
+#
+# Run:
+#   gmk run trace --file examples/basics/nested_ref/gmk.yml
+
+vars:
+  leaf: "found it"
+  three: "${leaf}"
+  two: "${three}"
+  one: "${two}"
+
+targets:
+  trace:
+    phony: true
+    run: |
+      echo "one=${one}"
+      echo "two=${two}"
+      echo "three=${three}"
+      echo "leaf=${leaf}"
