@@ -119,9 +119,25 @@ func executeRun(out io.Writer, file, targetName string, dryRun bool) error {
 	return nil
 }
 
-// runOneTarget materializes and executes a single target through the
+// RunOneTarget materializes and executes a single target through the
 // Stage 3b store-backed path. Errors wrap the target name for clean
 // diagnostic surfaces.
+//
+// Exported in Stage 3c.1.2 so the integration test driver
+// (internal/integration) can exercise the actual production target-
+// run code path including prelude evaluation. Before the export, the
+// integration test maintained a parallel "this is the contract"
+// reimplementation that drifted out of sync with the real cli
+// (notably: it didn't evaluate target preludes, so prelude-using
+// examples failed in test even though they worked at the command
+// line). One canonical implementation, tested everywhere.
+func RunOneTarget(ctx context.Context, out io.Writer, project *ir.Project, t *ir.Target, st *store.Store, day string) error {
+	return runOneTarget(ctx, out, project, t, st, day)
+}
+
+// runOneTarget is the package-private impl. RunOneTarget is the
+// exported wrapper kept thin so the cli package can still call the
+// short name internally.
 func runOneTarget(ctx context.Context, out io.Writer, project *ir.Project, t *ir.Target, st *store.Store, day string) error {
 	fmt.Fprintf(out, "gmk: target %s\n", t.Name)
 

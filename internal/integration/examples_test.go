@@ -22,20 +22,22 @@
 package integration
 
 import (
-	"fmt"
+	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 
+	"github.com/suhrut/gmk/internal/cli"
 	"github.com/suhrut/gmk/internal/dag"
 	"github.com/suhrut/gmk/internal/ir"
 	"github.com/suhrut/gmk/internal/load"
 	"github.com/suhrut/gmk/internal/materialize"
 	"github.com/suhrut/gmk/internal/render"
 	"github.com/suhrut/gmk/internal/resolve"
-	"github.com/suhrut/gmk/internal/runner"
+	"github.com/suhrut/gmk/internal/store"
 	"github.com/suhrut/gmk/internal/template"
 )
 
@@ -193,7 +195,15 @@ func TestExamplesTargetsConsistent(t *testing.T) {
 				}
 				// Run script must resolve as a template, including any
 				// ${render:...} expansions.
-				if tgt.Run != "" {
+				//
+				// Stage 3c.1.2: targets with non-empty preludes bind
+				// names that are only available after runtime prelude
+				// evaluation. The static body-resolution check can't
+				// know those names, so we skip the check for prelude-
+				// using targets. TestExamplesRun exercises the actual
+				// runtime path (which evaluates the prelude before body
+				// resolution) and catches any real issue there.
+				if tgt.Run != "" && len(tgt.Prelude) == 0 {
 					if _, err := resolve.ResolveStringInScopeWithRender(tgt.Run, p.RootScope, renderDisp); err != nil {
 						t.Errorf("target %q run: %v", tname, err)
 					}
@@ -325,9 +335,24 @@ func TestExamplesRun(t *testing.T) {
 				t.Fatalf("topo sort: %v", err)
 			}
 
+			// Stage 3c.1.2: use the production target-run path via
+			// cli.RunOneTarget instead of the legacy materialize
+			// .WriteScript + runner.ScriptRunner combo. The legacy
+			// path doesn't evaluate target preludes, so examples that
+			// use them (e.g. 03-k8s-deployment) fail in test while
+			// working at the command line. One canonical path means
+			// "if it passes here, gmk run also passes."
+			st, err := store.Open(project.Root)
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			defer st.Close()
+			day := materialize.Today()
+			ctx := context.Background()
+
 			for _, tname := range order {
 				tgt := project.Targets[tname]
-				if err := runOneExampleTarget(project, tgt); err != nil {
+				if err := cli.RunOneTarget(ctx, io.Discard, project, tgt, st, day); err != nil {
 					t.Errorf("target %q: %v", tname, err)
 					return
 				}
@@ -359,63 +384,9 @@ func findLeafTargets(p *ir.Project) []string {
 	return leaves
 }
 
-// runOneExampleTarget mirrors cli/run.go's runOneTarget closely but is
-// kept here to keep the integration test free of cobra and to make the
-// regression assertion explicit: this is the contract the cli must
-// honour, and the cli is just one of several future drivers (Stage 12's
-// daemon being another).
-func runOneExampleTarget(project *ir.Project, t *ir.Target) error {
-	scriptPath, err := materialize.WriteScript(t, project)
-	if err != nil {
-		return fmt.Errorf("materialize: %w", err)
-	}
-
-	env, err := resolveExampleTargetEnv(project, t)
-	if err != nil {
-		return fmt.Errorf("env: %w", err)
-	}
-
-	var cwd string
-	if t.Cwd != "" {
-		cwd, err = resolve.ResolveStringInScope(t.Cwd, project.RootScope)
-		if err != nil {
-			return fmt.Errorf("cwd: %w", err)
-		}
-	}
-
-	r := &runner.ScriptRunner{ScriptPath: scriptPath, Lang: t.Lang}
-	input := map[string]any{}
-	if len(env) > 0 {
-		input["env"] = env
-	}
-	if cwd != "" {
-		input["cwd"] = cwd
-	}
-
-	out, err := r.Run(input)
-	if err != nil {
-		return fmt.Errorf("exec (exit_code=%v): %w", out["exit_code"], err)
-	}
-	if code, ok := out["exit_code"].(int); ok && code != 0 {
-		return fmt.Errorf("non-zero exit code: %d", code)
-	}
-	return nil
-}
-
-// resolveExampleTargetEnv resolves a target's env block. Same shape as
-// the cli's resolveTargetEnv — duplicated here to keep the integration
-// test free of cli/cobra imports.
-func resolveExampleTargetEnv(p *ir.Project, t *ir.Target) (map[string]string, error) {
-	if len(t.Env) == 0 {
-		return nil, nil
-	}
-	out := make(map[string]string, len(t.Env))
-	for k, v := range t.Env {
-		rv, err := resolve.ResolveStringInScope(v, p.RootScope)
-		if err != nil {
-			return nil, fmt.Errorf("env[%s]: %w", k, err)
-		}
-		out[k] = rv
-	}
-	return out, nil
-}
+// runOneExampleTarget and resolveExampleTargetEnv were the integration
+// test's parallel implementation of cli/run.go's per-target machinery.
+// They drifted out of sync once Stage 3c.1.2 added prelude evaluation
+// to cli/run.go but not to this driver. As of 3c.1.2 they're replaced
+// by direct calls to the exported cli.RunOneTarget — one canonical
+// path, tested in production-shape, no duplication.
