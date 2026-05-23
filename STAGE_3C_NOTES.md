@@ -763,3 +763,38 @@ only with prod passphrase; env-var override works.
 Both might warrant a future gmk improvement (env passthrough
 allowlist; literal `$$` escape for bash-style defaults in bodies).
 Not for this stage.
+
+### Third gotcha: bash parameter expansion forms collide with gmk's parser
+
+While exercising the demo on a real machine, `registry-ensure`
+failed with:
+
+```
+Error: target "registry-ensure": body resolution: parse error at :1:17: unexpected character '#'
+```
+
+The body had `port="${registry##*:}"` — bash's "strip longest prefix"
+parameter expansion for extracting the port from "localhost:5000".
+gmk's expression parser tokenises `${registry` and then trips on the
+`##`.
+
+Same root cause as gotcha #2 (bash's `${VAR:-default}`): any bash
+parameter-expansion operator inside `${...}` will collide with gmk's
+own `${...}` syntax.
+
+Operators to avoid in target bodies:
+  ${var#pat}   ${var##pat}    prefix strip (shortest/longest)
+  ${var%pat}   ${var%%pat}    suffix strip
+  ${var:-x}    ${var:?x}      defaults / error-if-unset
+  ${var:N}     ${var:N:M}     substring
+  ${var/a/b}                  substitution
+  ${var^^}     ${var,,}       case
+
+Fix in the demo: split `registry: "localhost:5000"` into separate
+`registry_host` and `registry_port` vars (with `registry` kept as the
+composite for use in image refs). Trivial — but worth noting in the
+notes file so the pattern is documented.
+
+A future stage might add a literal-escape syntax (e.g. `$${...}` or
+backtick-quoting) so bash parameter expansion can survive a target
+body. Not for this stage.

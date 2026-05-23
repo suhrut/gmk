@@ -45,8 +45,14 @@ vars:
   namespace: "fullstack-app"
 
   # ---- Registry ----
-  registry:  "localhost:5000"
-  version:   "v0.1.0"
+  # registry_host + registry_port are kept separately to avoid bash
+  # parameter-expansion surgery in target bodies (gmk's expression
+  # parser doesn't know what to do with ${registry##*:} and such).
+  # registry is the convenience composite for use in image refs.
+  registry_host: "localhost"
+  registry_port: "5000"
+  registry:      "localhost:5000"
+  version:       "v0.1.0"
 
   # ---- Generated artifact locations ----
   out_dir:        ".gmk-cache/out"
@@ -326,8 +332,6 @@ targets:
     doc: Boot Zot if not already running. Idempotent.
     run: |
       set -e
-      port="${registry##*:}"
-
       if docker ps --format '{{.Names}}' | grep -q "^${zot_container}$"; then
         echo "registry already running: http://${registry}"
         exit 0
@@ -338,7 +342,7 @@ targets:
       docker run -d \
         --name "${zot_container}" \
         --restart unless-stopped \
-        -p "${port}:5000" \
+        -p "${registry_port}:5000" \
         -v "${zot_volume}:/var/lib/registry" \
         "${zot_image}" >/dev/null
 
