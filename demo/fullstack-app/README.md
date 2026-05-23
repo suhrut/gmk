@@ -49,17 +49,48 @@ need the tools that target uses.
 
 ## First-time setup
 
-Before the first run, create the CA password file:
+Before the first run, create a JSON keys file. The CA generation
+target reads its passphrase from this file. Profiles let you keep
+demo/dev/prod passphrases side by side without juggling files.
+
+Project-specific (preferred):
 
 ```
-mkdir -p ~/.gmk/fullstack-app
-chmod 700 ~/.gmk/fullstack-app
-printf '%s' 'your-strong-passphrase' > ~/.gmk/fullstack-app/key
-chmod 600 ~/.gmk/fullstack-app/key
+mkdir -p ~/.gmk/fullstack-app && chmod 700 ~/.gmk/fullstack-app
+cp keys.example.json ~/.gmk/fullstack-app/keys
+$EDITOR ~/.gmk/fullstack-app/keys     # change the demo passphrase
+chmod 600 ~/.gmk/fullstack-app/keys
 ```
 
-(The `pki-ca` target also accepts `~/.gmk/key` as a global fallback if
-you have multiple gmk projects sharing one CA password.)
+Or the global fallback at `~/.gmk/keys` (same schema, shared across
+all gmk projects that don't override).
+
+The schema (see `keys.example.json` for the full version):
+
+```json
+{
+  "default": {
+    "ca":     "a-passphrase",
+    "sqlite": "another-passphrase"
+  },
+  "prod": {
+    "ca":      { "password": "prod-passphrase", "algorithm": "aes256" },
+    "sqlite":  { "password": "prod-sqlite-passphrase" }
+  }
+}
+```
+
+Each entry is either a bare string (just the passphrase) OR an
+object with a `password` field (the object form is future-proof for
+adding `algorithm` and other metadata per entry — currently unused).
+
+By default the demo uses the `demo` profile (set by the `key_profile`
+var at the top of `gmk.yml`). Override at runtime:
+
+```
+GMK_PROFILE=prod gmk run pki-ca       # use prod passphrase
+GMK_PROFILE=prod gmk run all          # whole pipeline with prod profile
+```
 
 Then tidy the backend's Go module once:
 
@@ -166,7 +197,10 @@ does the same steps standalone.
 ```
 demo/fullstack-app/
 ├── README.md         (this file)
-├── gmk.yml           (the whole pipeline, ~650 lines, well-sectioned)
+├── gmk.yml           (the whole pipeline, ~660 lines, well-sectioned)
+├── keys.example.json (template — copy to ~/.gmk/fullstack-app/keys)
+├── scripts/
+│   └── read-key.sh   (bash helper sourced by the pki targets)
 ├── backend/
 │   ├── main.go       (Go HTTP server + Postgres client)
 │   ├── go.mod

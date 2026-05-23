@@ -1,0 +1,15 @@
+{
+  "default": {
+    "ca":     "demo-CA-passphrase",
+    "sqlite": "demo-sqlite-key"
+  },
+  "demo": {
+    "ca":     "demo-CA-passphrase",
+    "sqlite": "demo-sqlite-key"
+  },
+  "prod": {
+    "ca":      { "password": "prod-CA-passphrase",         "algorithm": "aes256" },
+    "sqlite":  { "password": "prod-sqlite-key" },
+    "secrets": { "password": "prod-secrets-encryption-key" }
+  }
+}

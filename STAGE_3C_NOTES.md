@@ -697,3 +697,69 @@ Validation in the sandbox (without docker/k3s/openssl/oras/jinja):
   /tmp project: ${render:tmpl(...mapvar, extra=x)} splat works,
   ${map:fn(items=list, ...)} drives a Python function correctly,
   output files written correctly.
+
+---
+
+## Demo follow-up: JSON keys file with profiles (May 23 2026)
+
+User feedback on the May 23 demo: the raw-password single-line `key`
+file is too rigid. Moved to a JSON `keys` file with named profiles
+and multiple named entries per profile, so the demo can grow to
+cover sqlite encryption, secrets encryption, etc., without changing
+the file format.
+
+### Schema
+
+```json
+{
+  "default": {
+    "ca":     "passphrase",
+    "sqlite": "passphrase"
+  },
+  "prod": {
+    "ca":      { "password": "prod-pass", "algorithm": "aes256" },
+    "sqlite":  { "password": "prod-sqlite-pass" }
+  }
+}
+```
+
+Each entry is either a bare string OR an object with `password`.
+Object form is future-proof for `algorithm` and other per-entry
+metadata. Same schema at `~/.gmk/<project>/keys` (preferred) and
+`~/.gmk/keys` (global fallback).
+
+### Implementation
+
+- `demo/fullstack-app/scripts/read-key.sh` — bash helper, sourced
+  into target bodies, exports a `read_key NAME PROFILE` function
+  that returns a path to a chmod-600 temp file. Caller traps cleanup.
+- `demo/fullstack-app/keys.example.json` — full schema example.
+- `gmk.yml`: new `key_profile: "demo"` var; pki-ca and pki-server-cert
+  source the helper; env-var override via `GMK_PROFILE`.
+
+Why a bash helper instead of a gmk function: gmk's runs table records
+function results, so a `read-key` function would expose the password
+via `gmk inspect`. Bash keeps the secret entirely off gmk's data
+path. Validated end-to-end with openssl in the sandbox: demo profile
+key decrypts only with demo passphrase; prod profile key decrypts
+only with prod passphrase; env-var override works.
+
+### Two gmk gotchas surfaced (worth documenting, not bugs)
+
+1. **Caller's env vars don't reach target bodies by default.** Only
+   the env block + a controlled subset is passed. To forward a
+   caller's GMK_PROFILE, use `GMK_PROFILE_OVERRIDE: "${env:GMK_PROFILE:-}"`
+   in the env block.
+
+2. **Bash's `${VAR:-default}` collides with gmk's expression
+   interpolation in target bodies.** gmk eagerly parses `${...:-...}`
+   as a default-value gmk expression and substitutes accordingly,
+   so bash never sees the cascade. Workaround: use plain `if`/`else`
+   in target bodies for fallback logic. Comments inside a YAML block
+   scalar are part of the body string, so even `${VAR:-x}` in a
+   bash comment will be eaten by the gmk parser — keep `${` out of
+   target-body comments.
+
+Both might warrant a future gmk improvement (env passthrough
+allowlist; literal `$$` escape for bash-style defaults in bodies).
+Not for this stage.

@@ -4,9 +4,12 @@
 # Backend build output.
 backend/build/
 
-# Generated PKI / manifests / bundle staging.
-# (.gmk-cache/ above covers most of these, but be explicit for clarity.)
+# Local copies of secrets — keys belong in ~/.gmk/, not in the tree,
+# but ignore them defensively in case anyone copies one in by accident.
+keys.json
+keys
 *.crt
 *.key
 *.csr
 *.srl
+!keys.example.json

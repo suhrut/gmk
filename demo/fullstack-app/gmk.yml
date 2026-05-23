@@ -3,8 +3,10 @@
 # This project demonstrates that gmk's Stage 3c.2 feature set is
 # sufficient to model a real-world deployment workflow:
 #
-#   1. Bootstrap a self-signed CA (raw password from
-#      ~/.gmk/<project>/key or ~/.gmk/key)
+#   1. Bootstrap a self-signed CA (passphrase read from a JSON keys
+#      file at ~/.gmk/<project>/keys, with multiple named profiles —
+#      see keys.example.json for the schema, and the pki-ca target
+#      for the resolver)
 #   2. Run a local Zot OCI registry
 #   3. Build a Go backend + plain HTML/JS frontend into container
 #      images, push to Zot
@@ -99,6 +101,11 @@ vars:
   server_subject: "/C=US/O=FullstackApp Demo/CN=fullstack-app.local"
   ca_days:        3650
   server_days:    365
+
+  # Which profile in ~/.gmk/<project>/keys (or ~/.gmk/keys) to read
+  # passwords from. Override at runtime by setting GMK_PROFILE in the
+  # environment. See keys.example.json for the file shape.
+  key_profile:    "demo"
 
   # ---- Zot registry container ----
   zot_container: "gmk-zot-fullstack"
@@ -195,9 +202,15 @@ targets:
 
   pki-ca:
     doc: |
-      Generate the encrypted CA key + self-signed CA cert.
-      Reads the password from ~/.gmk/${project}/key (preferred) or
-      ~/.gmk/key (fallback). Idempotent — skips if ca.crt exists.
+      Generate the encrypted CA key + self-signed CA cert. Reads the
+      CA passphrase from ~/.gmk/${project}/keys (preferred) or
+      ~/.gmk/keys (global fallback). The keys file is JSON with
+      named profiles; see keys.example.json. Idempotent — skips if
+      ca.crt exists.
+    env:
+      GMK_KEY_PROJECT: "${project}"
+      KEY_PROFILE_FALLBACK: "${key_profile}"
+      GMK_PROFILE_OVERRIDE: "${env:GMK_PROFILE:-}"
     run: |
       set -e
       mkdir -p "${pki_dir}"
@@ -208,27 +221,19 @@ targets:
         exit 0
       fi
 
-      project_pw="$HOME/.gmk/${project}/key"
-      global_pw="$HOME/.gmk/key"
-      if [ -f "$project_pw" ]; then
-        pw_file="$project_pw"
-        echo "using password file: $pw_file (project-specific)"
-      elif [ -f "$global_pw" ]; then
-        pw_file="$global_pw"
-        echo "using password file: $pw_file (global fallback)"
+      # Source the helper. Profile resolution: caller's GMK_PROFILE
+      # if set, else the project's key_profile gmk var. Plain if/else
+      # because bash default-expansion syntax collides with gmk's own
+      # expression interpolation in target bodies.
+      source scripts/read-key.sh
+      if [ -n "$GMK_PROFILE_OVERRIDE" ]; then
+        profile="$GMK_PROFILE_OVERRIDE"
       else
-        echo "no CA password file found." >&2
-        echo "" >&2
-        echo "Create one with a single line containing the desired password:" >&2
-        echo "" >&2
-        echo "    mkdir -p ~/.gmk/${project} && \\" >&2
-        echo "    chmod 700 ~/.gmk/${project} && \\" >&2
-        echo "    printf '%s' 'your-strong-passphrase' > ~/.gmk/${project}/key && \\" >&2
-        echo "    chmod 600 ~/.gmk/${project}/key" >&2
-        echo "" >&2
-        echo "Or use the global fallback at ~/.gmk/key." >&2
-        exit 1
+        profile="$KEY_PROFILE_FALLBACK"
       fi
+      pw_file=$(read_key ca "$profile") || exit 1
+      trap 'rm -f "$pw_file"' EXIT
+      echo "using profile: $profile"
 
       echo "generating CA key (aes256-encrypted) ..."
       openssl genrsa -aes256 -passout "file:$pw_file" -out "${pki_dir}/ca.key" 4096
@@ -248,8 +253,12 @@ targets:
     doc: |
       Generate the server cert signed by the CA (unencrypted key,
       since ingress controllers expect that). SAN list includes the
-      ingress host plus localhost.
+      ingress host plus localhost. Uses the same keys/profile as pki-ca.
     deps: [pki-ca]
+    env:
+      GMK_KEY_PROJECT: "${project}"
+      KEY_PROFILE_FALLBACK: "${key_profile}"
+      GMK_PROFILE_OVERRIDE: "${env:GMK_PROFILE:-}"
     run: |
       set -e
       if [ -f "${pki_dir}/server.crt" ]; then
@@ -257,9 +266,14 @@ targets:
         exit 0
       fi
 
-      project_pw="$HOME/.gmk/${project}/key"
-      global_pw="$HOME/.gmk/key"
-      if [ -f "$project_pw" ]; then pw_file="$project_pw"; else pw_file="$global_pw"; fi
+      source scripts/read-key.sh
+      if [ -n "$GMK_PROFILE_OVERRIDE" ]; then
+        profile="$GMK_PROFILE_OVERRIDE"
+      else
+        profile="$KEY_PROFILE_FALLBACK"
+      fi
+      pw_file=$(read_key ca "$profile") || exit 1
+      trap 'rm -f "$pw_file"' EXIT
 
       san_conf="${pki_dir}/server-san.cnf"
       printf 'subjectAltName = DNS:%s, DNS:localhost, IP:127.0.0.1\n' \
